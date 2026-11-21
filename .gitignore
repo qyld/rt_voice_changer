@@ -1,0 +1,14 @@
+# 构建产物
+voice_changer/build/
+voice_changer/dist/
+voice_changer/test_out/
+release/
+# 模型与音频 (通过 Releases 分发)
+*.onnx
+*.pth
+*.bin
+*.wav
+*.flac
+*.mp3
+config.ini
+__pycache__/
