@@ -1,7 +1,7 @@
 ﻿; AI 变声器 安装脚本 (Inno Setup 6)
 ; 编译: iscc installer\setup.iss   (先编译 voice_changer, obs_plugin, driver, 并准备好 voice_changer\dist)
 #define AppName "AI 变声器"
-#define AppVer "2.0.0"
+#define AppVer "2.0.1"
 #define Dist "..\voice_changer\dist"
 
 [Setup]
@@ -48,6 +48,8 @@ Source: "..\driver\scripts\*"; DestDir: "{app}\driver\scripts"; Flags: ignorever
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\VoiceChanger.exe"
+Name: "{group}\{#AppName}（CPU 模式）"; Filename: "{app}\VoiceChanger.exe"; Parameters: "--cpu"
+Name: "{group}\运行日志"; Filename: "{userappdata}\AIVoiceChanger\log.txt"
 Name: "{group}\安装虚拟麦克风 (测试版)"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\driver\install_test.ps1"" -EnableTestSigning"; WorkingDir: "{app}\driver"
 Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\VoiceChanger.exe"; Tasks: desktop

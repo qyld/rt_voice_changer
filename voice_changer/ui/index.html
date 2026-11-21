@@ -259,7 +259,7 @@ function renderState() {
   renderVoices(); renderGuide();
   // 推理设备
   const gpu = S.gpus.find(g => g.index === S.activeDevice);
-  $('#devName').textContent = gpu ? '显卡加速 · ' + gpu.name : 'CPU 运算';
+  $('#devName').textContent = gpu ? (S.gpuModels < 4 ? '显卡+CPU 混合 · ' : '显卡加速 · ') + gpu.name : 'CPU 运算';
   $('#devDot').className = 'dot ' + (gpu ? 'ok' : 'warn');
   opt($('#compute'), [...S.gpus.map(g => [g.index, `显卡：${g.name}（${g.vendor}）`]), [-1, 'CPU（无显卡时使用）']], S.compute);
   // 设备

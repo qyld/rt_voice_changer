@@ -7,6 +7,9 @@
 #include <wrl.h>
 
 #include <WebView2.h>
+#include <dbghelp.h>
+#include <exception>
+#pragma comment(lib, "dbghelp.lib")
 
 #include <algorithm>
 #include <atomic>
@@ -26,9 +29,12 @@
 #include "resource.h"
 #include "settings.h"
 #include "vc_engine.h"
+#include "vc_log.h"
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
+
+static bool g_force_cpu = false;
 
 #define WM_APP_TASK_DONE (WM_APP + 1)
 
@@ -87,10 +93,26 @@ public:
     void init() {
         st.load(user_dir() / "config.ini");
         std::string err;
-        if (!io.init(err)) toast(err, true);
+        if (!io.init(err)) { vc_log("音频初始化失败: " + err); toast(err, true); }
         gpus = enum_gpus();
+        for (auto& g : gpus) vc_log("显卡 #" + std::to_string(g.index) + ": " + g.name + " (" + g.vendor + ", " + std::to_string(g.vram_mb) + " MB)");
         scan_voices();
         load_settings();
+        if (g_force_cpu && compute >= 0) {  // 命令行 --cpu (开始菜单 "CPU 模式")
+            vc_log("命令行 --cpu: 强制使用 CPU");
+            compute = -1;
+            cfg = cpu_profile();
+            save();
+        }
+        // 防崩溃循环: 上次在显卡初始化/预热过程中程序异常退出 -> 这次改用 CPU
+        if (st.geti("gpu_trial", 0) && compute >= 0) {
+            vc_log("检测到上次使用显卡 #" + std::to_string(compute) + " 时程序异常退出, 本次改用 CPU");
+            pending_toast = "上次使用显卡时程序异常退出，已自动改用 CPU。可在 高级模式 → 设备与算力 中重新选择显卡。";
+            compute = -1;
+            cfg = cpu_profile();
+            st.set("gpu_trial", 0);
+            save();
+        }
     }
 
     // ------------------------------------------------------------ 消息处理
@@ -100,6 +122,7 @@ public:
         auto num = [&](const char* k) { return (float)m[k].num; };
         if (cmd == "ready") {
             send_state();
+            if (!pending_toast.empty()) { toast(pending_toast, true); pending_toast.clear(); }
             if (!common_loaded && !busy) reload_models();
         } else if (cmd == "selectVoice") {
             voice_id = m["id"].str;
@@ -192,7 +215,7 @@ public:
     void on_timer() {
         if (!web) return;
         const bool run = io.running();
-        if (run && eng.device() < 0 && io.load.load() > 0.95f) {
+        if (run && io.load.load() > 0.95f) {
             if (++overload_ticks >= 30 && cfg.block_ms < 600) {  // 连续 3 秒跟不上
                 overload_ticks = 0;
                 io.stop();
@@ -204,6 +227,10 @@ public:
                 send_state();
             }
         } else overload_ticks = 0;
+        if (eng.errors.load() > 0 && !error_toasted) {
+            error_toasted = true;
+            toast("推理过程中出现错误（已自动静音该段，不影响继续使用）。如频繁出现请把日志发给我们：" + u8((user_dir() / L"log.txt").wstring()), true);
+        }
         std::ostringstream o;
         o << "{\"type\":\"status\",\"running\":" << (run ? "true" : "false") << ",\"busy\":" << (busy ? "true" : "false")
           << ",\"inDb\":" << eng.stats.in_db.load() << ",\"outDb\":" << eng.stats.out_db.load()
@@ -226,7 +253,8 @@ private:
     Settings st;
     std::vector<GpuInfo> gpus;
     std::vector<VoiceEntry> voices;
-    std::string voice_id, mic_name, out_name = "auto", mon_name, ui_mode = "simple";
+    std::string voice_id, mic_name, out_name = "auto", mon_name, ui_mode = "simple", pending_toast;
+    bool error_toasted = false;
     int compute = -1, out_buffer_ms = 40, overload_ticks = 0;
     bool first_run = true, monitor = false, bypass = false;
     std::atomic<bool> common_loaded{false};
@@ -345,7 +373,13 @@ private:
         busy = true;
         post("{\"type\":\"busy\",\"value\":true}");
         worker = std::thread([this, job, done] {
-            job();
+            try {
+                job();
+            } catch (const std::exception& e) {
+                vc_log(std::string("后台任务异常: ") + e.what());
+            } catch (...) {
+                vc_log("后台任务未知异常");
+            }
             {
                 std::lock_guard<std::mutex> lk(task_mu);
                 task_done = [this, done] { busy = false; post("{\"type\":\"busy\",\"value\":false}"); done(); };
@@ -360,18 +394,46 @@ private:
         auto it = std::find_if(voices.begin(), voices.end(), [&](auto& v) { return v.id == voice_id; });
         fs::path vdir = it != voices.end() ? it->dir : fs::path();
         auto err = std::make_shared<std::string>();
-        bool reload_common = !voice_only || !common_loaded;
+        bool reload_common = !voice_only || !common_loaded || compute != eng.device();
+        if (compute >= 0) { st.set("gpu_trial", 1); st.save(); }  // 若在显卡初始化中崩溃, 下次启动会改用 CPU
+        auto fell = std::make_shared<bool>(false);
+        auto c = compute;
+        vc_log("加载模型: 设备=" + std::string(c >= 0 ? "显卡 #" + std::to_string(c) : "CPU") + ", 声音=" + vdir.filename().u8string());
         run_task(
-            [this, vdir, err, reload_common] {
-                if (reload_common) {
-                    common_loaded = eng.load_common(exe_dir() / "models" / "common", 0, *err, compute);
-                    if (!common_loaded) return;
+            [this, vdir, err, reload_common, fell, c] {
+                auto load = [&](int dev) -> bool {
+                    if (reload_common || dev != eng.device()) {
+                        common_loaded = eng.load_common(exe_dir() / "models" / "common", 0, *err, dev);
+                        if (!common_loaded) return false;
+                    }
+                    if (!vdir.empty() && !eng.load_voice(vdir, *err)) return false;
+                    eng.configure(cfg);
+                    std::string we;
+                    if (!eng.warmup(&we)) { *err = "预热失败: " + we; return false; }
+                    return true;
+                };
+                if (!load(c) && c >= 0) {  // 显卡整体失败 -> CPU
+                    vc_log("显卡加载/预热失败, 改用 CPU: " + *err);
+                    *fell = true;
+                    err->clear();
+                    cfg = cpu_profile();
+                    load(-1);
                 }
-                if (!vdir.empty() && !eng.load_voice(vdir, *err)) return;
-                eng.configure(cfg);
-                eng.warmup();
             },
-            [this, err, was] {
+            [this, err, was, fell] {
+                st.set("gpu_trial", 0);
+                if (*fell) {
+                    compute = -1;
+                    toast("显卡推理不可用，已自动改用 CPU（详情见日志 log.txt）", true);
+                } else if (compute >= 0 && eng.gpu_model_count() == 0) {  // 全部模型都退回了 CPU
+                    vc_log("所有模型在显卡上执行失败, 改用 CPU 档参数");
+                    compute = -1;
+                    cfg = cpu_profile();
+                    eng.configure(cfg);
+                    toast("这块显卡暂不支持本软件的推理，已自动改用 CPU（详情见日志 log.txt）", true);
+                } else if (eng.gpu_fell_back()) {
+                    toast("部分模型在显卡上运行失败，已自动改用 CPU 运行这部分（不影响使用）", false);
+                }
                 if (!err->empty()) toast(*err, true);
                 if (!eng.device_note().empty()) toast(eng.device_note(), true);
                 save();
@@ -424,13 +486,14 @@ private:
                     sig[i] = float(0.08 * (2 * ph - 1));
                 }
                 auto bench = [&](int dev, EngineConfig c) -> float {
+                  try {
                     VoiceEngine e;
                     std::string er;
                     e.configure(c);
                     if (!e.load_common(exe_dir() / "models" / "common", 0, er, dev) || !e.load_voice(vdir, er)) return 99.f;
                     if (dev >= 0 && e.device() < 0) return 99.f;  // 显卡不可用
                     e.configure(c);
-                    e.warmup();
+                    if (!e.warmup() && dev >= 0) return 99.f;
                     const int B = e.block_io();
                     std::vector<float> o(B);
                     double tot = 0;
@@ -440,7 +503,12 @@ private:
                         e.process(&sig[p], o.data());
                         tot += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
                     }
+                    if (dev >= 0 && e.gpu_fell_back()) vc_log("性能测试: 显卡 #" + std::to_string(dev) + " 部分模型改用 CPU");
                     return float(tot / std::max(1, n) / (1000.0 * B / rate));
+                  } catch (const std::exception& ex) {
+                    vc_log(std::string("性能测试异常: ") + ex.what());
+                    return 99.f;
+                  }
                 };
                 for (auto& g : gl) {
                     float r = bench(g.index, gpu_profile());
@@ -485,7 +553,7 @@ private:
         std::ostringstream o;
         o << "{\"type\":\"state\",\"mode\":" << json_escape(ui_mode) << ",\"firstRun\":" << (first_run ? "true" : "false")
           << ",\"running\":" << (io.running() ? "true" : "false") << ",\"voice\":" << json_escape(voice_id)
-          << ",\"compute\":" << compute << ",\"activeDevice\":" << eng.device()
+          << ",\"compute\":" << compute << ",\"activeDevice\":" << (eng.gpu_model_count() > 0 ? eng.device() : -1) << ",\"gpuModels\":" << eng.gpu_model_count()
           << ",\"virtualMic\":" << (io.find_virtual_mic_output() >= 0 ? "true" : "false");
         o << ",\"voices\":[";
         for (size_t i = 0; i < voices.size(); ++i)
@@ -554,7 +622,26 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep) {
+    // 崩溃时写日志 + 小型转储 (crash.dmp), 便于定位显卡驱动等问题
+    char b[128];
+    std::snprintf(b, sizeof(b), "程序崩溃: 异常代码 0x%08lX, 地址 %p", ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    vc_log(b);
+    HANDLE f = CreateFileW((user_dir() / L"crash.dmp").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mi{GetCurrentThreadId(), ep, FALSE};
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f, MiniDumpNormal, &mi, nullptr, nullptr);
+        CloseHandle(f);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int show) {
+    vc_log_set_file((user_dir() / L"log.txt").wstring());
+    g_force_cpu = cmdline && wcsstr(cmdline, L"--cpu") != nullptr;
+    vc_log(std::string("==== AI 变声器 v2.0.1 启动 ====") + (g_force_cpu ? " (CPU 模式)" : ""));
+    SetUnhandledExceptionFilter(crash_filter);
+    std::set_terminate([] { vc_log("程序异常终止 (未捕获的异常)"); std::abort(); });
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     WNDCLASSEXW wc{sizeof(wc)};

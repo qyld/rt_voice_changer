@@ -13,6 +13,7 @@
 
 #include "audio_io.h"
 #include "gpu_enum.h"
+#include "vc_log.h"
 #include "vc_engine.h"
 
 #ifdef _WIN32
@@ -49,7 +50,7 @@ static void usage() {
         "  --buffer <ms>     输出缓冲 (默认 40) --common <目录> 公共模型目录\n");
 }
 
-int main(int argc, char** argv) {
+static int run_main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     int wargc = 0;
@@ -128,6 +129,9 @@ int main(int argc, char** argv) {
             std::printf("[%s] 块长 %.0fms 上下文 %dms: 平均 %.1fms 最慢 %.1fms RTF %.2f %s\n", name.c_str(), blk, cfg.extra_ms, avg, worst,
                         avg / blk, avg / blk < 0.7 ? "流畅" : avg / blk < 1 ? "勉强" : "跟不上");
             if (!eng.device_note().empty()) std::printf("    %s\n", eng.device_note().c_str());
+            if (d >= 0)
+                std::printf("    显卡上运行的模型: %d/4%s\n", eng.gpu_model_count(),
+                            eng.gpu_fell_back() ? " (其余因显卡执行失败改用 CPU, 原因见上方日志)" : "");
         }
         return 0;
     }
@@ -248,5 +252,15 @@ int main(int argc, char** argv) {
                     eng.stats.in_db.load(), eng.stats.out_db.load(), eng.stats.f0_hz.load(), eng.stats.infer_ms.load(),
                     io.load.load() * 100, io.underruns.load());
         std::fflush(stdout);
+    }
+}
+
+int main(int argc, char** argv) {
+    vc_log_set_console(true);
+    try {
+        return run_main(argc, argv);
+    } catch (const std::exception& e) {
+        std::printf("错误: %s\n", e.what());
+        return 2;
     }
 }

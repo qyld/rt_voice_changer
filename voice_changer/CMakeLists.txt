@@ -15,7 +15,7 @@ if(MSVC)
 endif()
 
 # 核心引擎 (与界面无关)
-add_library(vc_core STATIC src/vc_engine.cpp src/audio_io.cpp src/gpu_enum.cpp)
+add_library(vc_core STATIC src/vc_engine.cpp src/audio_io.cpp src/gpu_enum.cpp src/vc_log.cpp)
 target_include_directories(vc_core PUBLIC src ${ORT_DIR}/include third_party/miniaudio)
 target_link_libraries(vc_core PUBLIC ${ORT_DIR}/lib/onnxruntime.lib dxgi)
 

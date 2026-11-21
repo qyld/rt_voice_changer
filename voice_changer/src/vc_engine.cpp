@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "onnx_model.h"
+#include "vc_log.h"
 
 namespace {
 
@@ -82,12 +83,15 @@ EngineConfig gpu_profile() {
 
 // GPU 上优先使用 fp16 模型 (xxx_fp16.onnx), 不存在则用 fp32
 std::unique_ptr<OnnxModel> VoiceEngine::make_model(const fs::path& dir, const char* name) {
-    fs::path p = dir / (std::string(name) + ".onnx");
+    const fs::path cpu = dir / (std::string(name) + ".onnx");
+    fs::path p = cpu;
     if (device_ >= 0 && !std::getenv("VC_NO_FP16")) {
         fs::path h = dir / (std::string(name) + "_fp16.onnx");
         if (fs::exists(h)) p = h;
     }
-    return std::make_unique<OnnxModel>(ort_env(), p, threads_ ? threads_ : 4, device_);
+    auto m = std::make_unique<OnnxModel>(ort_env(), p, threads_ ? threads_ : 4, device_, cpu);
+    vc_log(std::string("加载模型 ") + p.filename().u8string() + (device_ >= 0 ? " (显卡 #" + std::to_string(device_) + ")" : " (CPU)"));
+    return m;
 }
 
 bool VoiceEngine::load_common(const fs::path& dir, int threads, std::string& err, int device) {
@@ -106,10 +110,12 @@ bool VoiceEngine::load_common(const fs::path& dir, int threads, std::string& err
         } catch (const std::exception& e) {
             if (device_ >= 0) {  // GPU 失败 -> 回退 CPU
                 device_note_ = std::string("显卡推理初始化失败, 已改用 CPU: ") + e.what();
+                vc_log(device_note_);
                 device_ = -1;
                 continue;
             }
             err = std::string("加载公共模型失败: ") + e.what();
+            vc_log(err);
             return false;
         }
     }
@@ -157,6 +163,7 @@ bool VoiceEngine::load_voice(const fs::path& dir, std::string& err) {
         return true;
     } catch (const std::exception& e) {
         err = std::string("加载声音模型失败: ") + e.what();
+        vc_log(err);
         return false;
     }
 }
@@ -224,7 +231,15 @@ void VoiceEngine::process(const float* in, float* out) {
     rs_in_.process(x.data(), x.size(), fifo16_);
     std::vector<float> om;
     if (ready()) {
-        infer_block(om);
+        const size_t before = fifo16_.size();
+        try {
+            infer_block(om);
+        } catch (const std::exception& e) {  // 绝不让推理异常结束程序: 本块输出静音
+            if (errors++ < 5) vc_log(std::string("推理异常 (本块静音): ") + e.what());
+            if (fifo16_.size() == before && before >= (size_t)block16_)  // 本块输入尚未取走
+                fifo16_.erase(fifo16_.begin(), fifo16_.begin() + block16_);
+            om.assign(block_m_, 0.f);
+        }
     } else {
         fifo16_.erase(fifo16_.begin(), fifo16_.begin() + std::min<size_t>(block16_, fifo16_.size()));
         om.assign(block_m_, 0.f);
@@ -581,13 +596,34 @@ void VoiceEngine::smooth_f0(int from) {
     }
 }
 
-void VoiceEngine::warmup() {
-    if (!ready()) return;
+int VoiceEngine::gpu_model_count() const {
+    int n = 0;
+    for (auto* m : {hubert_.get(), rmvpe_.get(), enc_.get(), dec_.get()}) n += (m && m->on_gpu()) ? 1 : 0;
+    return n;
+}
+bool VoiceEngine::gpu_fell_back() const {
+    for (auto* m : {hubert_.get(), rmvpe_.get(), enc_.get(), dec_.get()}) if (m && m->fell_back()) return true;
+    return false;
+}
+
+bool VoiceEngine::warmup(std::string* err) {
+    if (!ready()) return false;
+    try {
     // 用低幅噪声跑完整推理, 让 GPU 编译好固定尺寸的计算图; 之后恢复干净状态
     std::vector<float> n(block_io_), o(block_io_);
     for (int i = 0; i < block_io_; ++i) n[i] = 0.01f * gauss((uint64_t)i * 7919u);
     force_infer_ = true;
+    const int e0 = errors.load();
     for (int i = 0; i < 2; ++i) process(n.data(), o.data());
     force_infer_ = false;
     reset_state();
+    vc_log("预热完成: " + std::to_string(gpu_model_count()) + "/4 个模型在显卡上" + (gpu_fell_back() ? " (部分已改用 CPU)" : ""));
+    if (errors.load() != e0) { if (err) *err = "预热推理出错, 详见日志"; return false; }
+    return true;
+    } catch (const std::exception& e) {
+        force_infer_ = false;
+        if (err) *err = e.what();
+        vc_log(std::string("预热失败: ") + e.what());
+        return false;
+    }
 }

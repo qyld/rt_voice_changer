@@ -4,9 +4,14 @@
 #include <dml_provider_factory.h>
 #endif
 
+#include <atomic>
+#include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "vc_log.h"
 
 struct Tensor {
     std::vector<int64_t> shape;
@@ -17,15 +22,42 @@ struct Tensor {
 };
 
 // device: -1 = CPU; >=0 = DirectML 显卡序号 (DXGI EnumAdapters1 顺序, Intel/AMD/NVIDIA 通用)
+// 显卡上运行失败 (驱动不支持某算子/显存不足等) 时, 自动用 CPU + fp32 模型重建并重试, 不让程序崩溃。
 class OnnxModel {
 public:
-    OnnxModel(Ort::Env& env, const std::filesystem::path& path, int threads, int device = -1) : device_(device) {
+    OnnxModel(Ort::Env& env, const std::filesystem::path& path, int threads, int device = -1,
+              const std::filesystem::path& cpu_path = {})
+        : env_(env), threads_(threads), cpu_path_(cpu_path.empty() ? path : cpu_path), name_(path.filename().u8string()) {
+        create(path, device);
+    }
+
+    bool on_gpu() const { return device_ >= 0; }
+    bool fell_back() const { return fell_back_; }
+    const std::string& name() const { return name_; }
+
+    // 运行, 返回第一个输出 (float)
+    std::vector<float> run(std::vector<Tensor>& inputs, std::vector<int64_t>* out_shape = nullptr) {
+        if (device_ < 0) return run_once(inputs, out_shape);
+        try {
+            if (fake_fail()) throw std::runtime_error("模拟显卡执行失败 (VC_FAKE_GPU_FAIL)");
+            return run_once(inputs, out_shape);
+        } catch (const std::exception& e) {
+            vc_log("[显卡] " + name_ + " 在显卡上执行失败, 改用 CPU: " + e.what());
+            create(cpu_path_, -1);
+            fell_back_ = true;
+            return run_once(inputs, out_shape);
+        }
+    }
+
+private:
+    void create(const std::filesystem::path& path, int device) {
         Ort::SessionOptions so;
-        so.SetIntraOpNumThreads(threads);
+        so.SetIntraOpNumThreads(threads_);
         so.SetInterOpNumThreads(1);
         so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
         so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        if (device >= 0) {
+        const bool fake = std::getenv("VC_FAKE_GPU") != nullptr;  // 测试: 用 CPU 冒充显卡, 验证回退逻辑
+        if (device >= 0 && !fake) {
 #ifdef _WIN32
             so.DisableMemPattern();  // DirectML 要求
             const OrtDmlApi* dml = nullptr;
@@ -34,14 +66,17 @@ public:
 #else
             throw std::runtime_error("GPU 仅支持 Windows DirectML");
 #endif
-        } else {
+        } else if (device < 0) {
             so.AddConfigEntry("session.intra_op.allow_spinning", "1");
         }
 #ifdef _WIN32
-        session_ = Ort::Session(env, path.wstring().c_str(), so);
+        session_ = Ort::Session(env_, path.wstring().c_str(), so);
 #else
-        session_ = Ort::Session(env, path.string().c_str(), so);
+        session_ = Ort::Session(env_, path.string().c_str(), so);
 #endif
+        device_ = device;
+        in_names_.clear();
+        out_names_.clear();
         Ort::AllocatorWithDefaultOptions alloc;
         for (size_t k = 0; k < session_.GetInputCount(); ++k)
             in_names_.push_back(session_.GetInputNameAllocated(k, alloc).get());
@@ -49,10 +84,15 @@ public:
             out_names_.push_back(session_.GetOutputNameAllocated(k, alloc).get());
     }
 
-    bool on_gpu() const { return device_ >= 0; }
+    bool fake_fail() const {
+        const char* f = std::getenv("VC_FAKE_GPU_FAIL");
+        if (!f) return false;
+        std::string s(f), base = name_.substr(0, name_.find('.'));
+        if (base.size() > 5 && base.compare(base.size() - 5, 5, "_fp16") == 0) base.resize(base.size() - 5);
+        return s == "all" || s.find(base) != std::string::npos;
+    }
 
-    // 运行, 返回第一个输出 (float)
-    std::vector<float> run(std::vector<Tensor>& inputs, std::vector<int64_t>* out_shape = nullptr) {
+    std::vector<float> run_once(std::vector<Tensor>& inputs, std::vector<int64_t>* out_shape) {
         auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
         std::vector<Ort::Value> vals;
         for (auto& t : inputs) {
@@ -71,8 +111,12 @@ public:
         return std::vector<float>(p, p + info.GetElementCount());
     }
 
-private:
+    Ort::Env& env_;
+    int threads_;
+    std::filesystem::path cpu_path_;
+    std::string name_;
     Ort::Session session_{nullptr};
     std::vector<std::string> in_names_, out_names_;
     int device_ = -1;
+    bool fell_back_ = false;
 };

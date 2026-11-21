@@ -68,7 +68,10 @@ public:
     bool ready() const { return hubert_ && rmvpe_ && enc_ && dec_; }
     int device() const { return device_; }               // 实际使用的设备
     const std::string& device_note() const { return device_note_; }
-    void warmup();                                        // 按当前尺寸预跑一次 (GPU 首次编译图)
+    bool warmup(std::string* err = nullptr);              // 按当前尺寸预跑一次 (GPU 首次编译图); 失败返回 false
+    int gpu_model_count() const;                          // 当前仍在显卡上运行的模型数 (0~4)
+    bool gpu_fell_back() const;                           // 是否有模型因显卡执行失败改用了 CPU
+    std::atomic<int> errors{0};                           // 推理异常次数 (已吞掉, 输出静音)
 
     int block_io() const { return block_io_; }           // 每块 io 采样数
     float latency_ms() const;                             // 算法固有延迟估计
