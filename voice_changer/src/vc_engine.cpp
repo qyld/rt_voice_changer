@@ -66,20 +66,54 @@ float to_db(float rms) { return 20.f * std::log10(std::max(rms, 1e-6f)); }
 VoiceEngine::VoiceEngine() = default;
 VoiceEngine::~VoiceEngine() = default;
 
-bool VoiceEngine::load_common(const fs::path& dir, int threads, std::string& err) {
-    try {
-        if (threads <= 0) {
-            unsigned hc = std::max(2u, std::thread::hardware_concurrency());
-            threads = (int)std::clamp(hc / 2, 2u, 8u);
-        }
-        threads_ = threads;
-        hubert_ = std::make_unique<OnnxModel>(ort_env(), dir / "hubert.onnx", threads);
-        rmvpe_ = std::make_unique<OnnxModel>(ort_env(), dir / "rmvpe.onnx", threads);
-        return true;
-    } catch (const std::exception& e) {
-        err = std::string("加载公共模型失败: ") + e.what();
-        return false;
+EngineConfig cpu_profile() {
+    EngineConfig c;  // 默认值即 CPU 档
+    return c;
+}
+EngineConfig gpu_profile() {
+    EngineConfig c;
+    // 实测 (男声->女声, Whisper 字错误率): 块长 120/150ms 时接缝过多 CER 0.38; 200ms 时 0.215
+    c.block_ms = 200;
+    c.extra_ms = 2000;     // 大上下文: 更接近训练时的 3.7s 切片
+    c.crossfade_ms = 50;
+    c.lookahead_ms = 60;
+    return c;
+}
+
+// GPU 上优先使用 fp16 模型 (xxx_fp16.onnx), 不存在则用 fp32
+std::unique_ptr<OnnxModel> VoiceEngine::make_model(const fs::path& dir, const char* name) {
+    fs::path p = dir / (std::string(name) + ".onnx");
+    if (device_ >= 0 && !std::getenv("VC_NO_FP16")) {
+        fs::path h = dir / (std::string(name) + "_fp16.onnx");
+        if (fs::exists(h)) p = h;
     }
+    return std::make_unique<OnnxModel>(ort_env(), p, threads_ ? threads_ : 4, device_);
+}
+
+bool VoiceEngine::load_common(const fs::path& dir, int threads, std::string& err, int device) {
+    if (threads <= 0) {
+        unsigned hc = std::max(2u, std::thread::hardware_concurrency());
+        threads = (int)std::clamp(hc / 2, 2u, 8u);
+    }
+    threads_ = threads;
+    device_ = device;
+    device_note_.clear();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        try {
+            hubert_ = make_model(dir, "hubert");
+            rmvpe_ = make_model(dir, "rmvpe");
+            return true;
+        } catch (const std::exception& e) {
+            if (device_ >= 0) {  // GPU 失败 -> 回退 CPU
+                device_note_ = std::string("显卡推理初始化失败, 已改用 CPU: ") + e.what();
+                device_ = -1;
+                continue;
+            }
+            err = std::string("加载公共模型失败: ") + e.what();
+            return false;
+        }
+    }
+    return false;
 }
 
 bool VoiceEngine::load_voice(const fs::path& dir, std::string& err) {
@@ -93,8 +127,8 @@ bool VoiceEngine::load_voice(const fs::path& dir, std::string& err) {
         v.hop = (int)json_num(js, "hop", v.sample_rate / 100);
         v.inter_channels = (int)json_num(js, "inter_channels", 192);
         v.n_speakers = (int)json_num(js, "n_speakers", 1);
-        auto enc = std::make_unique<OnnxModel>(ort_env(), dir / "enc.onnx", threads_ ? threads_ : 4);
-        auto dec = std::make_unique<OnnxModel>(ort_env(), dir / "dec.onnx", threads_ ? threads_ : 4);
+        auto enc = make_model(dir, "enc");
+        auto dec = make_model(dir, "dec");
         // 检索库 (可选)
         idx_n_ = 0;
         idx_feats_.clear();
@@ -158,6 +192,8 @@ void VoiceEngine::configure(const EngineConfig& c) {
 void VoiceEngine::reset_state() {
     in16_.assign(win16_, 0.f);
     f0cache_.assign(p_len_, 0.f);
+    gate_gain_.assign(p_len_, 0.f);
+    gate_hold_ = 0;
     sola_buf_.assign(cross_m_, 0.f);
     fifo16_.assign(16, 0.f);     // 预填少量零, 吸收重采样器的 ±1 抖动
     fifo_out_.assign(16, 0.f);
@@ -301,31 +337,21 @@ void VoiceEngine::infer_block(std::vector<float>& out) {
     // ---- 1. 取新块 + 噪声门 ----
     std::vector<float> blk(fifo16_.begin(), fifo16_.begin() + block16_);
     fifo16_.erase(fifo16_.begin(), fifo16_.begin() + block16_);
-    const float gate = params.gate_db.load();
-    if (gate > -90.f) {
-        // 与 RVC 一致: 40ms 窗 RMS, 低于门限的 10ms 帧置零
-        std::vector<float> ctx(in16_.end() - 480, in16_.end());
-        ctx.insert(ctx.end(), blk.begin(), blk.end());
-        ctx.insert(ctx.end(), 160, 0.f);
-        for (int fi = 0; fi < block16_ / 160; ++fi) {
-            double e = 0;
-            int c0 = 480 + fi * 160 - 240;
-            for (int k = 0; k < 640; ++k) { float v = ctx[c0 + k]; e += double(v) * v; }
-            if (to_db(float(std::sqrt(e / 640))) < gate)
-                std::fill(blk.begin() + fi * 160, blk.begin() + (fi + 1) * 160, 0.f);
-        }
-    }
+    // 注意: 不再把低音量帧置零送进 HuBERT (会切掉轻声字头字尾); 噪声门改为作用在输出上
     const int bf = block16_ / 160;
     std::memmove(in16_.data(), in16_.data() + block16_, (win16_ - block16_) * sizeof(float));
     std::copy(blk.begin(), blk.end(), in16_.end() - block16_);
     std::memmove(f0cache_.data(), f0cache_.data() + bf, (p_len_ - bf) * sizeof(float));
     std::fill(f0cache_.end() - bf, f0cache_.end(), 0.f);
+    std::memmove(gate_gain_.data(), gate_gain_.data() + bf, (p_len_ - bf) * sizeof(float));
+    update_gate(bf);
     abs_end_frame_ += bf;
     const long long win_start = abs_end_frame_ - p_len_;
 
     // 静音快速路径: 输出区间完全无声时跳过推理, 节省 CPU
-    const int chk = std::min(win16_, (ret_frames_ + la_frames_) * 160 + 1600);
-    bool silent = std::all_of(in16_.end() - chk, in16_.end(), [](float v) { return v == 0.f; });
+    // 噪声门在整个输出区间都关闭时跳过推理 (上一块已渐隐到 0, 下一块从 0 交叉淡入, 不会咔哒)
+    const int chk = std::min(p_len_, ret_frames_ + la_frames_ + 2);
+    bool silent = !force_infer_ && std::all_of(gate_gain_.end() - chk, gate_gain_.end(), [](float g) { return g <= 0.f; });
     if (silent) {
         out.assign(block_m_, 0.f);
         std::fill(sola_buf_.begin(), sola_buf_.end(), 0.f);
@@ -339,16 +365,26 @@ void VoiceEngine::infer_block(std::vector<float>& out) {
     std::vector<float> feats, f0;
     int T = 0;
     auto t1 = clk::now();
-    auto fut = std::async(std::launch::async, [&] { auto t = clk::now(); run_f0(f0); stats.f0_ms = ms_since(t); });
-    run_hubert(feats, T);
-    stats.hubert_ms = ms_since(t1);
-    fut.get();
+    if (device_ >= 0) {  // GPU: 顺序执行 (同一显卡队列, 并行无收益)
+        run_hubert(feats, T);
+        stats.hubert_ms = ms_since(t1);
+        auto t = clk::now();
+        run_f0(f0);
+        stats.f0_ms = ms_since(t);
+    } else {
+        auto fut = std::async(std::launch::async, [&] { auto t = clk::now(); run_f0(f0); stats.f0_ms = ms_since(t); });
+        run_hubert(feats, T);
+        stats.hubert_ms = ms_since(t1);
+        fut.get();
+    }
 
     const float key = params.pitch_shift.load();
     const float kf = std::pow(2.f, key / 12.f);
     const int Tf = (int)f0.size();
     const int nw = std::min(Tf - 4, p_len_);
     for (int i = 0; i < nw; ++i) f0cache_[p_len_ - nw + i] = f0[3 + (Tf - 4 - nw) + i] * kf;
+    static const bool no_smooth = std::getenv("VC_NO_F0SMOOTH") != nullptr;  // 调试开关
+    if (!no_smooth) smooth_f0(p_len_ - nw);
     {
         float last = 0;
         for (int i = p_len_ - 1; i >= p_len_ - bf; --i) if (f0cache_[i] > 0) { last = f0cache_[i]; break; }
@@ -436,6 +472,19 @@ void VoiceEngine::infer_block(std::vector<float>& out) {
         }
     }
 
+    // ---- 6b. 噪声门 (按帧增益插值, 平滑开合) ----
+    {
+        const int f_start = P - LA - R;
+        for (int k = 0; k < R * hop; ++k) {
+            float pos = float(k) / hop;
+            int f = std::min((int)pos, R - 1);
+            float a = pos - f;
+            float g0 = gate_gain_[f_start + f];
+            float g1 = gate_gain_[std::min(f_start + f + 1, P - 1)];
+            inf[k] *= g0 * (1 - a) + g1 * a;
+        }
+    }
+
     // ---- 7. SOLA 拼接 ----
     int best = 0;
     {
@@ -457,4 +506,88 @@ void VoiceEngine::infer_block(std::vector<float>& out) {
 
     stats.infer_ms = ms_since(t0);
     stats.blocks++;
+}
+
+// 平滑噪声门: 40ms 窗 RMS 超过门限即开门 (并提前 30ms 打开, 保护字头),
+// 低于门限后保持 300ms, 再 80ms 线性渐隐 (保护字尾/轻声)
+void VoiceEngine::update_gate(int nf) {
+    const float thr = params.gate_db.load();
+    const int P = p_len_;
+    if (thr <= -90.f) {
+        std::fill(gate_gain_.end() - nf, gate_gain_.end(), 1.f);
+        return;
+    }
+    const int hold_frames = 30, release_frames = 8, pre_open = 3;
+    for (int f = P - nf; f < P; ++f) {
+        double e = 0;
+        int cnt = 0;
+        for (int k = f * 160 - 240; k < f * 160 + 400; ++k)
+            if (k >= 0 && k < win16_) { e += double(in16_[k]) * in16_[k]; ++cnt; }
+        bool loud = to_db(float(std::sqrt(e / std::max(1, cnt)))) >= thr;
+        float prev = f > 0 ? gate_gain_[f - 1] : 0.f;
+        float g;
+        if (loud) {
+            gate_hold_ = hold_frames;
+            g = 1.f;
+            for (int b = std::max(0, f - pre_open); b < f; ++b) gate_gain_[b] = 1.f;
+        } else if (gate_hold_ > 0) {
+            --gate_hold_;
+            g = prev > 0.f ? 1.f : 0.f;
+        } else {
+            g = std::max(0.f, prev - 1.f / release_frames);
+        }
+        gate_gain_[f] = g;
+    }
+}
+
+// 音高平滑: 词内 <=30ms 的无声空洞按对数线性插值补齐 (避免字中断音/电音), 再做 3 帧中值去除跳点
+void VoiceEngine::smooth_f0(int from) {
+    const int P = p_len_;
+    from = std::max(1, from - 4);
+    std::vector<float>& f = f0cache_;
+    for (int i = from; i < P; ++i) {
+        if (f[i] > 0 || f[i - 1] <= 0) continue;
+        int j = i;
+        while (j < P && f[j] <= 0) ++j;
+        if (j < P && j - i <= 3) {
+            double a = std::log(f[i - 1]), b = std::log(f[j]);
+            for (int k = i; k < j; ++k) f[k] = float(std::exp(a + (b - a) * double(k - i + 1) / (j - i + 1)));
+        }
+        i = j;
+    }
+    // 八度/跳点纠错: 与前 150ms 有声帧的中位音高比较; 接近 ±1 个八度则折回;
+    // 很轻的帧 (< -50dB, 字尾/气声, RMVPE 不可靠) 若偏离超过 4 个半音则沿用参考音高
+    for (int i = from; i < P; ++i) {
+        if (f[i] <= 0) continue;
+        float buf[15];
+        int n = 0;
+        for (int k = std::max(0, i - 15); k < i; ++k) if (f[k] > 0) buf[n++] = f[k];
+        if (n < 5) continue;
+        std::nth_element(buf, buf + n / 2, buf + n);
+        const double ref = buf[n / 2];
+        double d = 1200.0 * std::log2(f[i] / ref);
+        if (std::abs(d - 1200) < 300) { f[i] *= 0.5f; d -= 1200; }
+        else if (std::abs(d + 1200) < 300) { f[i] *= 2.f; d += 1200; }
+        if (std::abs(d) > 400) {
+            double e = 0;
+            for (int k = i * 160; k < std::min(win16_, i * 160 + 160); ++k) e += double(in16_[k]) * in16_[k];
+            if (to_db(float(std::sqrt(e / 160))) < -50.f) f[i] = float(ref);
+        }
+    }
+    std::vector<float> src(f.begin() + (from - 1), f.end());
+    for (int i = from; i < P - 1; ++i) {
+        float a = src[i - from], b = src[i - from + 1], c = src[i - from + 2];
+        if (a > 0 && b > 0 && c > 0) f[i] = std::max(std::min(a, b), std::min(std::max(a, b), c));
+    }
+}
+
+void VoiceEngine::warmup() {
+    if (!ready()) return;
+    // 用低幅噪声跑完整推理, 让 GPU 编译好固定尺寸的计算图; 之后恢复干净状态
+    std::vector<float> n(block_io_), o(block_io_);
+    for (int i = 0; i < block_io_; ++i) n[i] = 0.01f * gauss((uint64_t)i * 7919u);
+    force_infer_ = true;
+    for (int i = 0; i < 2; ++i) process(n.data(), o.data());
+    force_infer_ = false;
+    reset_state();
 }

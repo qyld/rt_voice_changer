@@ -16,9 +16,9 @@ if(MSVC)
 endif()
 
 # 核心引擎 (与界面无关)
-add_library(vc_core STATIC src/vc_engine.cpp src/audio_io.cpp)
+add_library(vc_core STATIC src/vc_engine.cpp src/audio_io.cpp src/gpu_enum.cpp)
 target_include_directories(vc_core PUBLIC src ${ORT_DIR}/include third_party/miniaudio)
-target_link_libraries(vc_core PUBLIC ${ORT_DIR}/lib/onnxruntime.lib)
+target_link_libraries(vc_core PUBLIC ${ORT_DIR}/lib/onnxruntime.lib dxgi)
 
 # 命令行工具
 add_executable(vc_cli src/vc_cli.cpp)
@@ -33,5 +33,5 @@ target_link_libraries(VoiceChanger PRIVATE vc_core d3d11 d3dcompiler dxgi)
 
 foreach(t vc_cli VoiceChanger)
   add_custom_command(TARGET ${t} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ORT_DIR}/lib/onnxruntime.dll ${ORT_DIR}/lib/onnxruntime_providers_shared.dll $<TARGET_FILE_DIR:${t}>)
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ORT_DIR}/lib/onnxruntime.dll ${ORT_DIR}/lib/onnxruntime_providers_shared.dll ${ORT_DIR}/lib/DirectML.dll $<TARGET_FILE_DIR:${t}>)
 endforeach()
