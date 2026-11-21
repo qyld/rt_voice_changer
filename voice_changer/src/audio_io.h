@@ -24,7 +24,8 @@ public:
     const std::vector<AudioDeviceDesc>& playback_devices() const { return plays_; }
     void refresh();
 
-    // out_idx: 输出设备 (直播一般选虚拟声卡 CABLE Input), mon_idx: 监听耳机 (-1 不监听)
+    // out_idx: 输出设备 (-1 = 不输出到声卡, 只给 OBS 插件); 装了驱动时选 "AI变声器 内部输出"
+    // mon_idx: 监听耳机 (-1 不监听). 变声结果始终同时写入共享内存供 OBS 插件读取
     bool start(VoiceEngine& eng, int cap_idx, int out_idx, int mon_idx, int out_buffer_ms, std::string& err);
     void stop();
     bool running() const { return running_; }
@@ -33,6 +34,10 @@ public:
     std::atomic<float> buffered_ms{0};
     std::atomic<float> load{0};   // 推理耗时 / 块时长
     std::atomic<bool> monitor_enabled{true};
+
+    bool obs_connected() const;                 // OBS 插件正在读取
+    int find_virtual_mic_output() const;        // 虚拟声卡驱动的渲染端点序号, 没装返回 -1
+    int find_device(bool capture, const std::string& name) const;
 
 private:
     friend struct AudioIOImpl;

@@ -12,3 +12,9 @@ release/
 *.mp3
 config.ini
 __pycache__/
+# 其他组件的构建产物/依赖
+obs_plugin/build/
+obs_plugin/deps/
+driver/build/
+driver/packages/
+driver/package/*.pdb

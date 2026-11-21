@@ -1,0 +1,34 @@
+/*++
+
+Module Name:
+
+    AIVirtualAudio.rc
+
+Abstract:
+
+    AI 变声器虚拟声卡驱动版本资源。
+
+--*/
+
+#include <windows.h>
+
+#include <ntverp.h>
+
+#define VER_FILETYPE                VFT_DRV
+#define VER_FILESUBTYPE             VFT2_DRV_SOUND
+#define VER_FILEDESCRIPTION_STR     "AI Voice Changer Virtual Audio Driver"
+#define VER_INTERNALNAME_STR        "AIVirtualAudio.sys"
+#define VER_ORIGINALFILENAME_STR    "AIVirtualAudio.sys"
+
+#undef  VER_COMPANYNAME_STR
+#define VER_COMPANYNAME_STR         "AI Voice Changer"
+#undef  VER_PRODUCTNAME_STR
+#define VER_PRODUCTNAME_STR         "AI Voice Changer Virtual Audio"
+#undef  VER_LEGALCOPYRIGHT_STR
+#define VER_LEGALCOPYRIGHT_STR      "Portions Copyright (C) Microsoft Corporation (MS-PL, Windows-driver-samples/sysvad)"
+#undef  VER_PRODUCTVERSION
+#define VER_PRODUCTVERSION          1,0,0,0
+#undef  VER_PRODUCTVERSION_STR
+#define VER_PRODUCTVERSION_STR      "1.0.0.0"
+
+#include "common.ver"

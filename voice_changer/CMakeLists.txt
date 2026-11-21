@@ -8,7 +8,6 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(ORT_DIR ${CMAKE_SOURCE_DIR}/third_party/onnxruntime)
-set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
 
 if(MSVC)
   add_compile_options(/utf-8 /O2 /fp:fast /arch:AVX2 /W3 /MP)
@@ -24,12 +23,12 @@ target_link_libraries(vc_core PUBLIC ${ORT_DIR}/lib/onnxruntime.lib dxgi)
 add_executable(vc_cli src/vc_cli.cpp)
 target_link_libraries(vc_cli PRIVATE vc_core)
 
-# 图形界面
-add_executable(VoiceChanger WIN32 src/gui_main.cpp
-  ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp ${IMGUI_DIR}/imgui_tables.cpp ${IMGUI_DIR}/imgui_widgets.cpp
-  ${IMGUI_DIR}/backends/imgui_impl_win32.cpp ${IMGUI_DIR}/backends/imgui_impl_dx11.cpp)
-target_include_directories(VoiceChanger PRIVATE ${IMGUI_DIR} ${IMGUI_DIR}/backends)
-target_link_libraries(VoiceChanger PRIVATE vc_core d3d11 d3dcompiler dxgi)
+# 图形界面 (Win32 + WebView2, 前端 ui/index.html 编入资源)
+set(WV2_DIR ${CMAKE_SOURCE_DIR}/third_party/webview2)
+add_executable(VoiceChanger WIN32 src/gui_main.cpp src/app.rc)
+target_include_directories(VoiceChanger PRIVATE ${WV2_DIR}/include)
+target_link_libraries(VoiceChanger PRIVATE vc_core ${WV2_DIR}/lib/WebView2LoaderStatic.lib shlwapi version ole32 shell32 advapi32)
+set_source_files_properties(src/app.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/ui/index.html;${CMAKE_SOURCE_DIR}/src/app.ico")
 
 foreach(t vc_cli VoiceChanger)
   add_custom_command(TARGET ${t} POST_BUILD

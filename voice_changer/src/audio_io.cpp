@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "shm_output.h"
 #include "vc_engine.h"
 
 #ifdef _WIN32
@@ -32,6 +33,7 @@ struct AudioIOImpl {
     bool cap_ok = false, out_ok = false, mon_ok = false;
     RingBuffer in_rb{1 << 18};
     OutState o, m;
+    aivc::ShmWriter shm;   // 给 OBS 插件的共享内存输出
 };
 
 namespace {
@@ -153,9 +155,11 @@ bool AudioIO::start(VoiceEngine& eng, int cap_idx, int out_idx, int mon_idx, int
     dc.dataCallback = capture_cb;
     if (ma_device_init(&im.ctx, &dc, &im.cap) != MA_SUCCESS) { err = "无法打开麦克风设备"; return false; }
     im.cap_ok = true;
-    const ma_device_id* oid = (out_idx >= 0 && out_idx < (int)im.play_info.size()) ? &im.play_info[out_idx].id : nullptr;
-    if (!open_play(&im.ctx, &im.out, oid, rate, out_cb)) { err = "无法打开输出设备"; stop(); return false; }
-    im.out_ok = true;
+    if (out_idx >= 0 && out_idx < (int)im.play_info.size()) {
+        if (!open_play(&im.ctx, &im.out, &im.play_info[out_idx].id, rate, out_cb)) { err = "无法打开输出设备"; stop(); return false; }
+        im.out_ok = true;
+    }
+    im.shm.create();
     if (mon_idx >= 0 && mon_idx < (int)im.play_info.size() && mon_idx != out_idx) {
         if (open_play(&im.ctx, &im.mon, &im.play_info[mon_idx].id, rate, mon_cb)) im.mon_ok = true;
     }
@@ -174,7 +178,7 @@ bool AudioIO::start(VoiceEngine& eng, int cap_idx, int out_idx, int mon_idx, int
 #endif
     running_ = true;
     th_ = std::thread(&AudioIO::worker, this);
-    ma_device_start(&im.out);
+    if (im.out_ok) ma_device_start(&im.out);
     if (im.mon_ok) ma_device_start(&im.mon);
     ma_device_start(&im.cap);
     return true;
@@ -187,6 +191,7 @@ void AudioIO::stop() {
     if (th_.joinable()) th_.join();
     if (im.out_ok) { ma_device_uninit(&im.out); im.out_ok = false; }
     if (im.mon_ok) { ma_device_uninit(&im.mon); im.mon_ok = false; }
+    im.shm.close();
 #ifdef _WIN32
     timeEndPeriod(1);
 #endif
@@ -203,15 +208,34 @@ void AudioIO::worker() {
     eng_->reset_state();
     while (running_) {
         size_t avail = im.in_rb.size();
-        if ((int)avail < B) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+        if ((int)avail < B) {
+            im.shm.heartbeat();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
         if ((int)avail > 3 * B) im.in_rb.skip(avail - B);  // 处理跟不上时丢弃积压, 防止延迟越来越大
         im.in_rb.read(in.data(), B);
         auto t = std::chrono::steady_clock::now();
         eng_->process(in.data(), out.data());
         float ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t).count();
         load = ms / (1000.f * B / rate);
-        im.o.rb.write(out.data(), B);
+        if (im.out_ok) im.o.rb.write(out.data(), B);
+        im.shm.write(out.data(), B);
         if (im.mon_ok) im.m.rb.write(out.data(), B);
         buffered_ms = 1000.f * im.o.rb.size() / rate;
     }
+}
+
+bool AudioIO::obs_connected() const { return impl_->shm.reader_connected(); }
+
+int AudioIO::find_device(bool capture, const std::string& name) const {
+    const auto& v = capture ? caps_ : plays_;
+    for (size_t i = 0; i < v.size(); ++i) if (v[i].name == name) return (int)i;
+    return -1;
+}
+
+int AudioIO::find_virtual_mic_output() const {
+    for (size_t i = 0; i < plays_.size(); ++i)
+        if (plays_[i].name.find("AI变声器 内部输出") != std::string::npos) return (int)i;
+    return -1;
 }

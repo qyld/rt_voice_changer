@@ -41,65 +41,115 @@ def run(cmd, env=None):
         raise SystemExit("命令失败: %s" % " ".join(cmd))
 
 
-def preprocess(inputs, exp_dir, sr, per=3.7):
-    """与 RVC preprocess.py 等价: 高通 -> 静音切分 -> 3.7s 分段 -> 归一化 -> 写 gt/16k wav。
-    这里用 librosa 读取音频，不依赖 ffmpeg。"""
-    import librosa
-    import numpy as np
+def make_slicer(sr):
+    """返回 (切分器, 高通滤波系数), 参数与 RVC preprocess.py 一致"""
     from scipy import signal
-    from scipy.io import wavfile
-
     sys.path.insert(0, RVC)
     from train.dataset.slicer2 import Slicer
-
-    gt_dir = os.path.join(exp_dir, "0_gt_wavs")
-    w16_dir = os.path.join(exp_dir, "1_16k_wavs")
-    for d in (gt_dir, w16_dir):
-        shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d)
     slicer = Slicer(sr=sr, threshold=-42, min_length=1500, min_interval=400,
                     hop_size=15, max_sil_kept=500)
-    bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=sr)
+    return slicer, signal.butter(N=5, Wn=48, btype="high", fs=sr)
+
+
+def slice_audio(audio, sr, slicer, bah, per=3.7):
+    """与 RVC preprocess.py 等价: 高通 -> 静音切分 -> 3.7s 分段 -> 归一化。逐段 yield (段号, float32 音频)。"""
+    import numpy as np
+    from scipy import signal
+    audio = signal.lfilter(bah[0], bah[1], audio)
     overlap, tail = 0.3, per + 0.3
+
+    def norm(a):
+        if a is None:
+            return None
+        peak = np.abs(a).max() if len(a) else 0
+        if not np.isfinite(peak) or peak <= 0 or peak > 2.5 or len(a) < sr * 0.5:
+            return None
+        return ((a / peak * (0.9 * 0.75)) + 0.25 * a).astype(np.float32)
+
+    idx = 0
+    for chunk in slicer.slice(audio):
+        i = 0
+        tmp = None
+        while True:
+            start = int(sr * (per - overlap) * i)
+            i += 1
+            if len(chunk[start:]) > tail * sr:
+                a = norm(chunk[start:start + int(per * sr)])
+                if a is not None:
+                    yield idx, a
+                idx += 1
+            else:
+                tmp = chunk[start:]
+                idx += 1
+                break
+        a = norm(tmp)
+        if a is not None:
+            yield idx, a
+        idx += 1
+
+
+def write_segment(exp_dir, stem, a, sr):
+    import librosa
+    from scipy.io import wavfile
+    wavfile.write(os.path.join(exp_dir, "0_gt_wavs", stem + ".wav"), sr, a)
+    a16 = librosa.resample(a, orig_sr=sr, target_sr=16000).astype("float32")
+    wavfile.write(os.path.join(exp_dir, "1_16k_wavs", stem + ".wav"), 16000, a16)
+
+
+def preprocess(inputs, exp_dir, sr, per=3.7):
+    """切分样本并写 gt/16k wav。这里用 librosa 读取音频，不依赖 ffmpeg。"""
+    import librosa
+
+    for d in ("0_gt_wavs", "1_16k_wavs"):
+        shutil.rmtree(os.path.join(exp_dir, d), ignore_errors=True)
+        os.makedirs(os.path.join(exp_dir, d))
+    slicer, bah = make_slicer(sr)
     total_sec = 0.0
     n_seg = 0
-
-    def norm_write(a, key, idx):
-        nonlocal n_seg, total_sec
-        peak = np.abs(a).max()
-        if not np.isfinite(peak) or peak <= 0 or peak > 2.5 or len(a) < sr * 0.5:
-            return
-        a = (a / peak * (0.9 * 0.75)) + 0.25 * a
-        wavfile.write(os.path.join(gt_dir, "%s_%s.wav" % (key, idx)), sr, a.astype(np.float32))
-        a16 = librosa.resample(a, orig_sr=sr, target_sr=16000).astype(np.float32)
-        wavfile.write(os.path.join(w16_dir, "%s_%s.wav" % (key, idx)), 16000, a16)
-        n_seg += 1
-        total_sec += len(a) / sr
-
     for k, path in enumerate(inputs):
         audio, _ = librosa.load(path, sr=sr, mono=True)
-        audio = signal.lfilter(bh, ah, audio)
-        idx = 0
-        tmp = None
-        for chunk in slicer.slice(audio):
-            i = 0
-            while True:
-                start = int(sr * (per - overlap) * i)
-                i += 1
-                if len(chunk[start:]) > tail * sr:
-                    norm_write(chunk[start:start + int(per * sr)], k, idx)
-                    idx += 1
-                else:
-                    tmp = chunk[start:]
-                    idx += 1
-                    break
-            norm_write(tmp, k, idx)
-            idx += 1
+        for idx, a in slice_audio(audio, sr, slicer, bah, per):
+            write_segment(exp_dir, "%s_%s" % (k, idx), a, sr)
+            n_seg += 1
+            total_sec += len(a) / sr
         log("  切分 %s 完成" % os.path.basename(path))
     log("数据切分完成: %d 段, 共 %.1f 秒" % (n_seg, total_sec))
     if n_seg == 0:
         raise SystemExit("没有有效音频片段")
     return total_sec
+
+
+def extract_features(exp_dir, gpus, env):
+    """RMVPE F0 + HuBERT 特征, 按 GPU 数分片并行。gpus 为物理卡号列表。
+    注意: 两个提取脚本都会用 i_gpu 参数覆盖 CUDA_VISIBLE_DEVICES, 所以必须传物理卡号。"""
+    for d in ("2a_f0", "2b-f0nsf", "3_feature768"):
+        shutil.rmtree(os.path.join(exp_dir, d), ignore_errors=True)
+    n = len(gpus)
+    for script in ("f0", "hubert"):
+        procs = []
+        for i, g in enumerate(gpus):
+            if script == "f0":
+                cmd = [PY, "train/dataset/extract_f0.py", "cuda", str(n), str(i), str(g), exp_dir, "true"]
+            else:
+                cmd = [PY, "train/dataset/extract_hubert_feature.py", "cuda:0", str(n), str(i), str(g),
+                       exp_dir, "v2", "true"]
+            log("$ " + " ".join(cmd))
+            procs.append(subprocess.Popen(cmd, cwd=RVC, env=dict(env, CUDA_VISIBLE_DEVICES=str(g))))
+        if any(p.wait() != 0 for p in procs):
+            raise SystemExit("特征提取失败 (%s)" % script)
+
+
+def pretrained_paths(sr_tag, lite, base):
+    """底模路径。base: zh=中文增强底模 (pretrain_zh.py 产出), official=官方底模, auto=有中文底模就用"""
+    d = os.path.join(RVC, "assets", "pretrained_v2")
+    suf = "_lite" if lite else ""
+    official = [os.path.join(d, "f0%s%s%s.pth" % (x, sr_tag, suf)) for x in "GD"]
+    zh = [os.path.join(d, "f0%s%s%s_zh.pth" % (x, sr_tag, suf)) for x in "GD"]
+    if base == "zh" and not all(os.path.exists(p) for p in zh):
+        raise SystemExit("找不到中文底模 %s, 请先运行 pretrain_zh.py 或用 --base official" % zh[0])
+    if base == "zh" or (base == "auto" and all(os.path.exists(p) for p in zh)):
+        return zh
+    return official
 
 
 def write_filelist_and_config(exp_dir, sr_tag, name, lite=False):
@@ -160,6 +210,8 @@ def main():
     ap.add_argument("--skip-train", action="store_true", help="跳过训练, 仅重新导出")
     ap.add_argument("--lite", action="store_true",
                     help="使用轻量底模 (声码器计算量 1/4, 适合 4 核及以下的普通 CPU; 需先运行 distill_lite.py)")
+    ap.add_argument("--base", default="auto", choices=["auto", "zh", "official"],
+                    help="底模: zh=中文增强底模 (更像目标/咬字更清楚), official=官方底模; 默认 auto: 中文底模存在则用它")
     args = ap.parse_args()
 
     os.environ.pop("https_proxy", None)
@@ -186,16 +238,10 @@ def main():
 
     env = dict(os.environ)
     env["PYTHONPATH"] = RVC
-    first_gpu = args.gpu.split("-")[0]
 
     if not args.skip_train:
         total_sec = preprocess(files, exp_dir, sr)
-        # F0 (RMVPE, GPU)
-        for d in ("2a_f0", "2b-f0nsf", "3_feature768"):
-            shutil.rmtree(os.path.join(exp_dir, d), ignore_errors=True)
-        e = dict(env, CUDA_VISIBLE_DEVICES=first_gpu)
-        run([PY, "train/dataset/extract_f0.py", "cuda", "1", "0", "0", exp_dir, "true"], e)
-        run([PY, "train/dataset/extract_hubert_feature.py", "cuda:0", "1", "0", "0", exp_dir, "v2", "true"], e)
+        extract_features(exp_dir, [args.gpu.split("-")[0]], env)
         if args.lite and args.sr != "40k":
             raise SystemExit("轻量底模目前只有 40k")
         write_filelist_and_config(exp_dir, args.sr, name, args.lite)
@@ -204,11 +250,11 @@ def main():
             # 数据越少, 需要的 epoch 越多 (每 epoch 步数少)
             epochs = 600 if total_sec < 120 else 300 if total_sec < 600 else 200 if total_sec < 1800 else 120
         save_every = min(args.save_every, epochs)
-        log("开始训练: %d epochs" % epochs)
+        pg, pd = pretrained_paths(args.sr, args.lite, args.base)
+        log("开始训练: %d epochs, 底模 %s" % (epochs, os.path.basename(pg)))
         run([PY, "-m", "train.train", "-e", name, "-sr", args.sr, "-f0", "1", "-bs", str(args.batch),
              "-g", args.gpu, "-te", str(epochs), "-se", str(save_every),
-             "-pg", "assets/pretrained_v2/f0G%s%s.pth" % (args.sr, "_lite" if args.lite else ""),
-             "-pd", "assets/pretrained_v2/f0D%s%s.pth" % (args.sr, "_lite" if args.lite else ""),
+             "-pg", pg, "-pd", pd,
              "-l", "1", "-c", "1", "-sw", "0", "-v", "v2"], dict(env, RVC_CUDA_GRAPH="0"))
 
     weight = os.path.join(RVC, "assets", "weights", "%s.pth" % name)

@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 变声器</title>
+<style>
+:root{
+  --bg:#0f1117; --panel:#171a23; --panel2:#1e2230; --line:#2a2f3f; --text:#e8eaf2; --sub:#8a90a6;
+  --accent:#7c5cff; --accent2:#00d2ff; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444;
+  --grad:linear-gradient(135deg,#7c5cff 0%,#00d2ff 100%);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:"Microsoft YaHei UI","PingFang SC",system-ui,sans-serif;font-size:14px;overflow:hidden;user-select:none}
+button{font-family:inherit;color:inherit;cursor:pointer;border:none;background:none}
+select,input{font-family:inherit}
+.app{display:flex;flex-direction:column;height:100%}
+/* 顶栏 */
+.top{display:flex;align-items:center;gap:14px;padding:14px 22px;border-bottom:1px solid var(--line);background:var(--panel)}
+.logo{width:34px;height:34px;border-radius:10px;background:var(--grad);display:grid;place-items:center;font-weight:800;font-size:16px;color:#fff;box-shadow:0 4px 14px #7c5cff55}
+.brand{font-size:17px;font-weight:700;letter-spacing:.5px}
+.brand small{display:block;font-size:11px;color:var(--sub);font-weight:400;letter-spacing:0}
+.spacer{flex:1}
+.pill{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);font-size:12px;color:var(--sub)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--sub)}
+.dot.ok{background:var(--ok);box-shadow:0 0 8px var(--ok)} .dot.warn{background:var(--warn)} .dot.err{background:var(--err)}
+.seg{display:flex;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:3px}
+.seg button{padding:6px 14px;border-radius:8px;font-size:13px;color:var(--sub)}
+.seg button.on{background:var(--accent);color:#fff}
+/* 主体 */
+.main{flex:1;display:flex;min-height:0}
+.left{flex:1;padding:20px 22px;overflow:auto;min-width:0}
+.right{width:360px;border-left:1px solid var(--line);background:var(--panel);padding:16px 18px;display:flex;flex-direction:column;gap:12px;overflow:auto}
+h3{font-size:13px;color:var(--sub);font-weight:500;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+h3 .act{font-size:12px;color:var(--accent2);text-decoration:none}
+h3 .act:first-of-type{margin-left:auto}
+h3 .act+.act{margin-left:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:14px}
+.card{position:relative;background:var(--panel);border:1.5px solid var(--line);border-radius:16px;padding:16px;cursor:pointer;transition:.15s}
+.card:hover{border-color:#454c66;transform:translateY(-1px)}
+.card.sel{border-color:var(--accent);background:linear-gradient(180deg,#7c5cff1a,var(--panel))}
+.avatar{width:52px;height:52px;border-radius:50%;display:grid;place-items:center;font-size:22px;font-weight:700;color:#fff;margin-bottom:12px}
+.card .nm{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .ds{color:var(--sub);font-size:12px;margin-top:4px;height:16px;overflow:hidden}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:6px;margin-top:10px;background:var(--panel2);color:var(--sub)}
+.tag.lite{color:#22d3ee;background:#22d3ee18}
+.play{position:absolute;right:12px;top:12px;width:30px;height:30px;border-radius:50%;background:var(--panel2);display:grid;place-items:center;font-size:12px}
+.play:hover{background:var(--accent)}
+.empty{padding:40px;text-align:center;color:var(--sub);border:1.5px dashed var(--line);border-radius:16px}
+/* 大开关 */
+.power{display:flex;flex-direction:column;align-items:center;gap:6px;padding:2px 0 0}
+.pbtn{width:112px;height:112px;border-radius:50%;background:var(--panel2);border:2px solid var(--line);display:grid;place-items:center;transition:.2s;position:relative}
+.pbtn svg{width:46px;height:46px;stroke:var(--sub)}
+.pbtn.on{background:var(--grad);border-color:transparent;box-shadow:0 0 0 8px #7c5cff22,0 10px 40px #7c5cff66}
+.pbtn.on svg{stroke:#fff}
+.pbtn.busy{opacity:.6;cursor:wait}
+.ptext{font-size:16px;font-weight:600}
+.psub{font-size:12px;color:var(--sub)}
+.dir{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.dir button{padding:10px 0;border-radius:10px;background:var(--panel2);border:1px solid var(--line);font-size:13px}
+.dir button.on{border-color:var(--accent);color:#fff;background:#7c5cff33}
+.box{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:10px 14px}
+.row{display:flex;align-items:center;gap:10px;margin:6px 0}
+.row label{width:78px;color:var(--sub);font-size:12px;flex-shrink:0}
+.row select{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:7px 8px;font-size:12.5px;outline:none}
+.meter{flex:1;height:8px;border-radius:4px;background:var(--bg);overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,#22c55e,#a3e635 70%,#f59e0b 90%,#ef4444);transition:width .08s}
+.guide{font-size:12.5px;line-height:1.7}
+.guide b{color:#fff}
+.guide .ok{color:var(--ok)} .guide .no{color:var(--sub)}
+.switch,.row label.switch{position:relative;width:38px;height:22px;flex-shrink:0}
+.switch input{display:none}
+.switch span{position:absolute;inset:0;background:var(--line);border-radius:22px;transition:.2s}
+.switch span:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s}
+.switch input:checked+span{background:var(--accent)}
+.switch input:checked+span:before{transform:translateX(16px)}
+/* 高级 */
+.adv{display:none;margin-top:24px}
+.app.advanced .adv{display:block}
+.tabs{display:flex;gap:6px;margin-bottom:14px}
+.tabs button{padding:7px 16px;border-radius:8px;background:var(--panel);border:1px solid var(--line);font-size:13px;color:var(--sub)}
+.tabs button.on{color:#fff;border-color:var(--accent)}
+.pane{display:none;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px}
+.pane.on{display:block}
+.sl{display:grid;grid-template-columns:120px 1fr 64px;align-items:center;gap:12px;margin:12px 0}
+.sl .k{color:var(--sub);font-size:12.5px}
+.sl .v{text-align:right;font-variant-numeric:tabular-nums;font-size:12.5px}
+.sl .hint{grid-column:2/4;color:var(--sub);font-size:11px;margin-top:-8px}
+input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:4px;background:var(--line);outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#fff;border:3px solid var(--accent);cursor:pointer}
+.btn{padding:8px 16px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);font-size:13px}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn:disabled{opacity:.5;cursor:default}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:6px}
+.stat{background:var(--panel2);border-radius:12px;padding:12px}
+.stat .n{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+.stat .l{font-size:11px;color:var(--sub);margin-top:2px}
+.bench{margin-top:12px;font-size:12.5px;line-height:1.8;color:var(--sub)}
+/* 底栏 */
+.foot{display:flex;align-items:center;gap:18px;padding:8px 22px;border-top:1px solid var(--line);font-size:12px;color:var(--sub);background:var(--panel)}
+.foot b{color:var(--text);font-weight:500}
+/* 提示 */
+#toast{position:fixed;left:50%;bottom:52px;transform:translateX(-50%) translateY(20px);opacity:0;padding:10px 18px;border-radius:10px;background:#262b3b;border:1px solid var(--line);font-size:13px;transition:.25s;max-width:70%;pointer-events:none;z-index:9}
+#toast.show{opacity:1;transform:translateX(-50%)}
+#toast.err{border-color:var(--err)}
+/* 向导 */
+.mask{position:fixed;inset:0;background:#000a;display:none;place-items:center;z-index:8}
+.mask.show{display:grid}
+.wiz{width:520px;background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:28px}
+.wiz h2{font-size:20px;margin-bottom:6px}
+.wiz p{color:var(--sub);font-size:13px;line-height:1.7}
+.steps{display:flex;gap:6px;margin:18px 0}
+.steps i{flex:1;height:4px;border-radius:4px;background:var(--line)}
+.steps i.on{background:var(--grad)}
+.wiz .foot2{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent2);border-radius:50%;animation:sp 1s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:#2a2f3f;border-radius:4px}::-webkit-scrollbar-track{background:transparent}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="top">
+    <div class="logo">AI</div>
+    <div class="brand">AI 变声器<small>实时 · 保留语气与情绪</small></div>
+    <div class="spacer"></div>
+    <div class="pill" title="推理设备"><span class="dot" id="devDot"></span><span id="devName">加载中…</span></div>
+    <div class="pill" title="直播输出"><span class="dot" id="outDot"></span><span id="outName">输出</span></div>
+    <div class="seg"><button id="mSimple" class="on">简易模式</button><button id="mAdv">高级模式</button></div>
+  </div>
+
+  <div class="main">
+    <div class="left">
+      <h3>选择声音 <a class="act" href="#" id="openVoices">打开声音文件夹</a><a class="act" href="#" id="rescan">刷新</a></h3>
+      <div class="grid" id="voices"></div>
+
+      <div class="adv">
+        <div class="tabs">
+          <button class="on" data-t="tSound">声音调节</button>
+          <button data-t="tDev">设备与算力</button>
+          <button data-t="tPerf">延迟与性能</button>
+        </div>
+        <div class="pane on" id="tSound">
+          <div class="sl"><span class="k">变调 (半音)</span><input type="range" min="-24" max="24" step="1" data-p="pitch"><span class="v"></span></div>
+          <div class="sl"><span class="k">音色相似度</span><input type="range" min="0" max="1" step="0.05" data-p="index_rate"><span class="v"></span>
+            <span class="hint">越高越像目标人；过高咬字可能变糊，建议 0.3~0.6</span></div>
+          <div class="sl"><span class="k">音量跟随原声</span><input type="range" min="0" max="1" step="0.05" data-p="rms_mix"><span class="v"></span>
+            <span class="hint">越低越跟随你说话的轻重起伏（情绪更真实）</span></div>
+          <div class="sl"><span class="k">清辅音保护</span><input type="range" min="0" max="0.5" step="0.01" data-p="protect"><span class="v"></span></div>
+          <div class="sl"><span class="k">噪声门限 (dB)</span><input type="range" min="-100" max="-30" step="1" data-p="gate_db"><span class="v"></span>
+            <span class="hint">环境安静时可调到 -70；环境吵调高。-100 为关闭</span></div>
+          <div class="sl"><span class="k">麦克风增益 (dB)</span><input type="range" min="-20" max="20" step="0.5" data-p="in_gain_db"><span class="v"></span></div>
+          <div class="sl"><span class="k">输出增益 (dB)</span><input type="range" min="-20" max="20" step="0.5" data-p="out_gain_db"><span class="v"></span></div>
+        </div>
+        <div class="pane" id="tDev">
+          <div class="row"><label>推理设备</label><select id="compute"></select></div>
+          <div class="row"><label>输出到</label><select id="outSel"></select></div>
+          <div class="row"><label>监听耳机</label><select id="monSel"></select></div>
+          <div class="row"><label></label><button class="btn" id="refreshDev">刷新设备</button><button class="btn pri" id="bench">一键性能测试</button></div>
+          <div class="bench" id="benchRes"></div>
+        </div>
+        <div class="pane" id="tPerf">
+          <div class="sl"><span class="k">块长 (ms)</span><input type="range" min="100" max="800" step="10" data-c="block_ms"><span class="v"></span>
+            <span class="hint">越小延迟越低，电脑压力越大；低于 200ms 咬字可能变差</span></div>
+          <div class="sl"><span class="k">上下文 (ms)</span><input type="range" min="300" max="3000" step="50" data-c="extra_ms"><span class="v"></span></div>
+          <div class="sl"><span class="k">交叉淡化 (ms)</span><input type="range" min="20" max="120" step="10" data-c="crossfade_ms"><span class="v"></span></div>
+          <div class="sl"><span class="k">前瞻 (ms)</span><input type="range" min="0" max="200" step="10" data-c="lookahead_ms"><span class="v"></span></div>
+          <div class="sl"><span class="k">输出缓冲 (ms)</span><input type="range" min="10" max="300" step="10" data-c="out_buffer_ms"><span class="v"></span></div>
+          <div class="row"><label></label><button class="btn" id="resetCfg">恢复推荐值</button></div>
+          <div class="stats">
+            <div class="stat"><div class="n" id="sLat">-</div><div class="l">总延迟 ms</div></div>
+            <div class="stat"><div class="n" id="sInf">-</div><div class="l">每块推理 ms</div></div>
+            <div class="stat"><div class="n" id="sLoad">-</div><div class="l">负载</div></div>
+            <div class="stat"><div class="n" id="sUnder">-</div><div class="l">断音次数</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="power">
+        <button class="pbtn" id="power" title="快捷键 Ctrl+Alt+V">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M12 3v8"/><path d="M6.3 7.3a8 8 0 1 0 11.4 0"/></svg>
+        </button>
+        <div class="ptext" id="ptext">开始变声</div>
+        <div class="psub" id="psub">快捷键 Ctrl+Alt+V</div>
+      </div>
+      <div>
+        <h3>变声方向</h3>
+        <div class="dir">
+          <button data-d="m2f">男声变女声</button><button data-d="none">原调</button><button data-d="f2m">女声变男声</button>
+        </div>
+      </div>
+      <div class="box">
+        <div class="row"><label>麦克风</label><select id="micSel"></select></div>
+        <div class="row"><label>说话音量</label><div class="meter"><i id="mIn"></i></div></div>
+        <div class="row"><label>变声输出</label><div class="meter"><i id="mOut"></i></div></div>
+        <div class="row"><label>监听自己</label><label class="switch"><input type="checkbox" id="monChk"><span></span></label>
+          <span class="psub" style="margin-left:auto;white-space:nowrap">临时原声</span><label class="switch"><input type="checkbox" id="byChk"><span></span></label></div>
+      </div>
+      <div class="box guide" id="guide"></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span>延迟 <b id="fLat">-</b></span><span>负载 <b id="fLoad">-</b></span><span>音高 <b id="fF0">-</b></span>
+    <div class="spacer"></div><span id="fMsg"></span>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<div class="mask" id="wizard">
+  <div class="wiz">
+    <div class="steps"><i class="on"></i><i></i><i></i></div>
+    <div id="wizBody"></div>
+    <div class="foot2"><button class="btn" id="wizSkip">跳过</button><button class="btn pri" id="wizNext">下一步</button></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s), $$ = s => document.querySelectorAll(s);
+const send = o => window.chrome.webview.postMessage(JSON.stringify(o));
+let S = null, busy = false, running = false, wizStep = 0, benchPending = false, benchData = null;
+const COLORS = ['#7c5cff,#c084fc','#00d2ff,#3b82f6','#f472b6,#fb7185','#22c55e,#14b8a6','#f59e0b,#ef4444','#6366f1,#06b6d4'];
+const fmt = { pitch: v => (v > 0 ? '+' : '') + Math.round(v), index_rate: v => (+v).toFixed(2), rms_mix: v => (+v).toFixed(2),
+  protect: v => (+v).toFixed(2), gate_db: v => v <= -100 ? '关闭' : Math.round(v), in_gain_db: v => (+v).toFixed(1), out_gain_db: v => (+v).toFixed(1) };
+
+function toast(t, err) { const e = $('#toast'); e.textContent = t; e.className = 'show' + (err ? ' err' : ''); clearTimeout(e._t); e._t = setTimeout(() => e.className = '', err ? 6000 : 3500); }
+function opt(sel, items, val) { sel.innerHTML = ''; for (const [v, t] of items) { const o = document.createElement('option'); o.value = v; o.textContent = t; if (v == val) o.selected = true; sel.appendChild(o); } }
+
+function renderVoices() {
+  const g = $('#voices'); g.innerHTML = '';
+  if (!S.voices.length) { g.innerHTML = '<div class="empty">还没有声音模型<br><br>把训练好的声音文件夹放到 voices 目录后点"刷新"</div>'; return; }
+  S.voices.forEach((v, i) => {
+    const c = document.createElement('div'); c.className = 'card' + (v.id === S.voice ? ' sel' : '');
+    const col = COLORS[i % COLORS.length];
+    c.innerHTML = `<div class="avatar" style="background:linear-gradient(135deg,${col})">${[...v.name][0] || '?'}</div>
+      <div class="nm"></div><div class="ds"></div><span class="tag ${v.lite ? 'lite' : ''}">${v.lite ? '轻量版 · 低配电脑' : '标准版 · 高音质'}</span>
+      ${v.preview ? '<button class="play" title="试听">▶</button>' : ''}`;
+    c.querySelector('.nm').textContent = v.name; c.querySelector('.ds').textContent = v.desc || '';
+    c.onclick = e => { if (e.target.classList.contains('play')) { new Audio(`https://voices.aivc/${encodeURIComponent(v.id)}/preview.wav`).play(); return; } if (v.id !== S.voice && !busy) send({ cmd: 'selectVoice', id: v.id }); };
+    g.appendChild(c);
+  });
+}
+
+function renderGuide() {
+  const vm = S.virtualMic;
+  $('#guide').innerHTML = `<h3 style="margin-bottom:8px">直播软件里这样设置</h3>
+    <div>抖音直播伴侣 / 快手 / 其他软件：麦克风选 <b>AI变声器 麦克风</b>
+      ${vm ? '<span class="ok">✓ 已安装</span>' : '<span class="no">（未安装虚拟麦克风驱动，请运行安装包中的"安装虚拟麦克风"）</span>'}</div>
+    <div style="margin-top:6px">OBS：来源 ➕ → <b>AI 变声器</b> <span id="obsSt" class="no">（等待 OBS 连接）</span></div>`;
+}
+
+function renderState() {
+  document.body.style.visibility = 'visible';
+  $('#app').classList.toggle('advanced', S.mode === 'advanced');
+  $('#mSimple').classList.toggle('on', S.mode !== 'advanced'); $('#mAdv').classList.toggle('on', S.mode === 'advanced');
+  renderVoices(); renderGuide();
+  // 推理设备
+  const gpu = S.gpus.find(g => g.index === S.activeDevice);
+  $('#devName').textContent = gpu ? '显卡加速 · ' + gpu.name : 'CPU 运算';
+  $('#devDot').className = 'dot ' + (gpu ? 'ok' : 'warn');
+  opt($('#compute'), [...S.gpus.map(g => [g.index, `显卡：${g.name}（${g.vendor}）`]), [-1, 'CPU（无显卡时使用）']], S.compute);
+  // 设备
+  opt($('#micSel'), [['', '系统默认麦克风'], ...S.mics.map(d => [d.name, d.name])], S.mic);
+  opt($('#outSel'), [['auto', '自动（虚拟麦克风 + OBS 插件）'], ['none', '仅 OBS 插件'], ...S.outs.map(d => [d.name, d.name])], S.out);
+  opt($('#monSel'), [['', '不监听'], ...S.outs.filter(d => !d.name.includes('AI变声器')).map(d => [d.name, d.name])], S.monitorDev);
+  $('#monChk').checked = !!S.p.monitor; $('#byChk').checked = !!S.p.bypass;
+  // 方向
+  $$('.dir button').forEach(b => b.classList.toggle('on', (b.dataset.d === 'm2f' && S.p.pitch > 0) || (b.dataset.d === 'f2m' && S.p.pitch < 0) || (b.dataset.d === 'none' && S.p.pitch == 0)));
+  $$('[data-p]').forEach(r => { r.value = S.p[r.dataset.p]; r.nextElementSibling.textContent = fmt[r.dataset.p](r.value); });
+  $$('[data-c]').forEach(r => { r.value = S.cfg[r.dataset.c]; r.nextElementSibling.textContent = r.value; });
+  setRunning(S.running);
+  if (S.firstRun && !$('#wizard').classList.contains('show') && wizStep === 0) showWizard();
+}
+
+function setRunning(r) {
+  running = r;
+  $('#power').classList.toggle('on', r);
+  $('#ptext').textContent = busy ? '加载中…' : r ? '变声中' : '开始变声';
+  $('#psub').textContent = r ? '点击停止 · Ctrl+Alt+V' : '快捷键 Ctrl+Alt+V';
+}
+
+function onStatus(s) {
+  if (s.running !== running) setRunning(s.running);
+  const pct = db => Math.max(0, Math.min(100, (db + 60) / 60 * 100)) + '%';
+  $('#mIn').style.width = s.running ? pct(s.inDb) : 0; $('#mOut').style.width = s.running ? pct(s.outDb) : 0;
+  const lat = Math.round(s.latencyMs), load = Math.round(s.load * 100);
+  $('#fLat').textContent = s.running ? lat + ' ms' : '-'; $('#fLoad').textContent = s.running ? load + '%' : '-';
+  $('#fF0').textContent = s.running && s.f0 > 0 ? Math.round(s.f0) + ' Hz' : '-';
+  $('#sLat').textContent = s.running ? lat : '-'; $('#sInf').textContent = s.running ? Math.round(s.inferMs) : '-';
+  $('#sLoad').textContent = s.running ? load + '%' : '-'; $('#sUnder').textContent = s.underruns;
+  const o = $('#obsSt'); if (o) { o.textContent = s.obs ? '✓ 已连接' : '（等待 OBS 连接）'; o.className = s.obs ? 'ok' : 'no'; }
+  const live = S && (S.virtualMic || s.obs);
+  $('#outName').textContent = !S ? '输出' : s.obs && S.virtualMic ? '虚拟麦克风 + OBS' : s.obs ? 'OBS 已连接' : S.virtualMic ? '虚拟麦克风' : '未连接直播软件';
+  $('#outDot').className = 'dot ' + (live ? 'ok' : 'warn');
+  $('#fMsg').textContent = s.running && s.load > 0.9 ? '⚠ 电脑性能紧张，可能断音：请在高级模式调大块长或换轻量版声音' : '';
+}
+
+function setBusy(b) { busy = b; $('#power').classList.toggle('busy', b); $('#bench').disabled = b; setRunning(running); }
+
+/* 向导 */
+const WIZ = [
+  () => `<h2>欢迎使用 AI 变声器</h2><p>只需三步完成设置。先选择你说话用的麦克风：</p>
+     <div class="row" style="margin-top:16px"><label>麦克风</label><select id="wMic"></select></div>`,
+  () => benchPending ? `<h2>正在测试电脑性能…</h2><p><span class="spin"></span>正在测试显卡和 CPU，自动选择最流畅的设置，大约需要 10~30 秒。</p>`
+     : `<h2>性能测试完成</h2><p>${benchData ? benchData.items.map(i => `${i.name}：${i.rtf < 0.6 ? '流畅' : i.rtf < 1 ? '可用' : '较慢'}（占用 ${Math.round(i.rtf * 100)}%）`).join('<br>') : ''}
+     <br>${benchData && benchData.ok ? '已自动选择最佳设置。' : '这台电脑性能偏弱，建议使用"轻量版"声音，或在高级模式调大块长。'}</p>`,
+  () => `<h2>在直播软件里选择变声器</h2><p>
+     · 抖音直播伴侣 / 快手直播伴侣 / 其他软件：麦克风选 <b>AI变声器 麦克风</b>${S.virtualMic ? '' : '（需先安装虚拟麦克风驱动）'}<br>
+     · OBS：在"来源"里添加 <b>AI 变声器</b><br><br>点击右侧大按钮开始变声，Ctrl+Alt+V 随时开关。</p>`
+];
+function showWizard() { wizStep = 0; $('#wizard').classList.add('show'); drawWiz(); }
+function drawWiz() {
+  $$('.steps i').forEach((e, i) => e.classList.toggle('on', i <= wizStep));
+  $('#wizBody').innerHTML = WIZ[wizStep]();
+  if (wizStep === 0) { opt($('#wMic'), [['', '系统默认麦克风'], ...S.mics.map(d => [d.name, d.name])], S.mic); $('#wMic').onchange = e => send({ cmd: 'device', kind: 'mic', name: e.target.value }); }
+  $('#wizNext').disabled = wizStep === 1 && benchPending;
+  $('#wizNext').textContent = wizStep === 2 ? '开始使用' : '下一步';
+}
+$('#wizNext').onclick = () => {
+  if (wizStep === 0) { wizStep = 1; benchPending = true; send({ cmd: 'autoConfig' }); }
+  else if (wizStep === 1) wizStep = 2;
+  else { $('#wizard').classList.remove('show'); send({ cmd: 'wizardDone' }); return; }
+  drawWiz();
+};
+$('#wizSkip').onclick = () => { $('#wizard').classList.remove('show'); send({ cmd: 'wizardDone' }); };
+
+/* 事件 */
+$('#power').onclick = () => { if (!busy) send({ cmd: 'toggle' }); };
+$('#mSimple').onclick = () => { S.mode = 'simple'; send({ cmd: 'mode', value: 'simple' }); renderState(); };
+$('#mAdv').onclick = () => { S.mode = 'advanced'; send({ cmd: 'mode', value: 'advanced' }); renderState(); };
+$$('.dir button').forEach(b => b.onclick = () => send({ cmd: 'preset', value: b.dataset.d }));
+$$('.tabs button').forEach(b => b.onclick = () => { $$('.tabs button').forEach(x => x.classList.remove('on')); $$('.pane').forEach(x => x.classList.remove('on')); b.classList.add('on'); $('#' + b.dataset.t).classList.add('on'); });
+$$('[data-p]').forEach(r => r.oninput = () => { r.nextElementSibling.textContent = fmt[r.dataset.p](r.value); S.p[r.dataset.p] = +r.value; send({ cmd: 'param', key: r.dataset.p, value: +r.value });
+  if (r.dataset.p === 'pitch') $$('.dir button').forEach(b => b.classList.toggle('on', (b.dataset.d === 'm2f' && r.value > 0) || (b.dataset.d === 'f2m' && r.value < 0) || (b.dataset.d === 'none' && r.value == 0))); });
+$$('[data-c]').forEach(r => { r.oninput = () => r.nextElementSibling.textContent = r.value; r.onchange = () => { const c = {}; $$('[data-c]').forEach(x => c[x.dataset.c] = +x.value); send({ cmd: 'config', ...c }); }; });
+$('#micSel').onchange = e => send({ cmd: 'device', kind: 'mic', name: e.target.value });
+$('#outSel').onchange = e => send({ cmd: 'device', kind: 'out', name: e.target.value });
+$('#monSel').onchange = e => send({ cmd: 'device', kind: 'monitor', name: e.target.value });
+$('#monChk').onchange = e => { if (e.target.checked && !S.monitorDev) toast('请先在高级模式 → 设备与算力 里选择监听耳机'); send({ cmd: 'param', key: 'monitor', value: e.target.checked ? 1 : 0 }); };
+$('#byChk').onchange = e => send({ cmd: 'param', key: 'bypass', value: e.target.checked ? 1 : 0 });
+$('#compute').onchange = e => send({ cmd: 'compute', device: +e.target.value });
+$('#refreshDev').onclick = () => send({ cmd: 'refreshDevices' });
+$('#bench').onclick = () => { $('#benchRes').innerHTML = '<span class="spin"></span>正在测试，约 10~30 秒…'; send({ cmd: 'autoConfig' }); };
+$('#resetCfg').onclick = () => send({ cmd: 'resetConfig' });
+$('#openVoices').onclick = e => { e.preventDefault(); send({ cmd: 'openVoices' }); };
+$('#rescan').onclick = e => { e.preventDefault(); send({ cmd: 'rescan' }); };
+
+window.chrome.webview.addEventListener('message', ev => {
+  const m = ev.data;
+  if (m.type === 'state') { S = m; renderState(); }
+  else if (m.type === 'status') onStatus(m);
+  else if (m.type === 'toast') toast(m.text, m.error);
+  else if (m.type === 'busy') setBusy(m.value);
+  else if (m.type === 'benchResult') {
+    benchPending = false; benchData = m;
+    $('#benchRes').innerHTML = m.items.map(i => `${i.name}：占用 ${Math.round(i.rtf * 100)}% · ${i.rtf < 0.6 ? '<span style="color:var(--ok)">流畅</span>' : i.rtf < 1 ? '可用' : '<span style="color:var(--err)">跟不上</span>'}`).join('<br>') + '<br>已自动应用最佳设置。';
+    if ($('#wizard').classList.contains('show')) drawWiz();
+  }
+});
+document.addEventListener('contextmenu', e => e.preventDefault());
+send({ cmd: 'ready' });
+</script>
+</body>
+</html>

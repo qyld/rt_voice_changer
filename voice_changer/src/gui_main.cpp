@@ -1,383 +1,637 @@
-// 实时变声器 图形界面 (Dear ImGui + DirectX 11)
-#include <d3d11.h>
+// AI 变声器 主程序: Win32 + WebView2 界面 (前端在 ui/index.html, 编进 exe 资源)
+//   JS -> C++ : window.chrome.webview.postMessage(JSON 字符串)  {"cmd": ..., ...}
+//   C++ -> JS : PostWebMessageAsJson                            {"type": "state"|"status"|"toast"|..., ...}
 #include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <wrl.h>
+
+#include <WebView2.h>
 
 #include <algorithm>
-#include <cstdio>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <functional>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "audio_io.h"
-#include "imgui.h"
-#include "imgui_impl_dx11.h"
-#include "imgui_impl_win32.h"
+#include "gpu_enum.h"
+#include "mini_json.h"
+#include "resource.h"
 #include "settings.h"
 #include "vc_engine.h"
 
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+using Microsoft::WRL::Callback;
+using Microsoft::WRL::ComPtr;
 
-static ID3D11Device* g_dev = nullptr;
-static ID3D11DeviceContext* g_ctx = nullptr;
-static IDXGISwapChain* g_swap = nullptr;
-static ID3D11RenderTargetView* g_rtv = nullptr;
-static UINT g_resize_w = 0, g_resize_h = 0;
-static bool g_hotkey_toggle = false;  // 全局快捷键 Ctrl+Alt+V: 变声/原声 切换
+#define WM_APP_TASK_DONE (WM_APP + 1)
 
-static void create_rtv() {
-    ID3D11Texture2D* bb = nullptr;
-    g_swap->GetBuffer(0, IID_PPV_ARGS(&bb));
-    g_dev->CreateRenderTargetView(bb, nullptr, &g_rtv);
-    bb->Release();
+static std::wstring w(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring r(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), r.data(), n);
+    return r;
 }
-static void cleanup_rtv() { if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; } }
-
-static bool create_device(HWND hwnd) {
-    DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 2;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = hwnd;
-    sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    D3D_FEATURE_LEVEL fl;
-    const D3D_FEATURE_LEVEL lv[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, lv, 2, D3D11_SDK_VERSION, &sd,
-                                               &g_swap, &g_dev, &fl, &g_ctx);
-    if (hr == DXGI_ERROR_UNSUPPORTED)  // 无独显/远程桌面: 软件渲染
-        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, lv, 2, D3D11_SDK_VERSION, &sd, &g_swap,
-                                           &g_dev, &fl, &g_ctx);
-    if (FAILED(hr)) return false;
-    create_rtv();
-    return true;
+static std::string u8(const std::wstring& s) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string r(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), r.data(), n, nullptr, nullptr);
+    return r;
 }
-
-static LRESULT WINAPI wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
-    if (ImGui_ImplWin32_WndProcHandler(h, msg, w, l)) return true;
-    switch (msg) {
-        case WM_SIZE:
-            if (w != SIZE_MINIMIZED) { g_resize_w = LOWORD(l); g_resize_h = HIWORD(l); }
-            return 0;
-        case WM_SYSCOMMAND:
-            if ((w & 0xfff0) == SC_KEYMENU) return 0;
-            break;
-        case WM_HOTKEY:
-            if (w == 1) g_hotkey_toggle = true;
-            return 0;
-        case WM_DESTROY:
-            PostQuitMessage(0);
-            return 0;
-    }
-    return DefWindowProcW(h, msg, w, l);
-}
-
 static fs::path exe_dir() {
-    wchar_t buf[MAX_PATH];
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    return fs::path(buf).parent_path();
+    wchar_t b[MAX_PATH];
+    GetModuleFileNameW(nullptr, b, MAX_PATH);
+    return fs::path(b).parent_path();
+}
+static fs::path user_dir() {  // %APPDATA%\AIVoiceChanger (安装到 Program Files 时 exe 目录不可写)
+    PWSTR p = nullptr;
+    fs::path r = exe_dir();
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p))) r = fs::path(p) / L"AIVoiceChanger";
+    CoTaskMemFree(p);
+    std::error_code ec;
+    fs::create_directories(r, ec);
+    return r;
+}
+static std::string read_file(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+static std::string json_field(const std::string& js, const std::string& key) {
+    auto k = js.find("\"" + key + "\"");
+    if (k == std::string::npos) return "";
+    auto q1 = js.find('"', js.find(':', k) + 1), q2 = js.find('"', q1 + 1);
+    return (q1 == std::string::npos || q2 == std::string::npos) ? "" : js.substr(q1 + 1, q2 - q1 - 1);
 }
 
-struct App {
+struct VoiceEntry {
+    std::string id, name, desc;
+    fs::path dir;
+    int sr = 40000;
+    bool lite = false, preview = false;
+};
+
+class App {
+public:
+    HWND hwnd = nullptr;
+    ComPtr<ICoreWebView2Controller> ctrl;
+    ComPtr<ICoreWebView2> web;
+
+    void init() {
+        st.load(user_dir() / "config.ini");
+        std::string err;
+        if (!io.init(err)) toast(err, true);
+        gpus = enum_gpus();
+        scan_voices();
+        load_settings();
+    }
+
+    // ------------------------------------------------------------ 消息处理
+    void on_message(const std::string& msg) {
+        JObj m = json_parse_flat(msg);
+        const std::string cmd = m["cmd"].str;
+        auto num = [&](const char* k) { return (float)m[k].num; };
+        if (cmd == "ready") {
+            send_state();
+            if (!common_loaded && !busy) reload_models();
+        } else if (cmd == "selectVoice") {
+            voice_id = m["id"].str;
+            reload_models(/*voice_only=*/true);
+        } else if (cmd == "toggle") {
+            if (io.running()) stop(); else start();
+        } else if (cmd == "preset") {
+            const std::string p = m["value"].str;
+            pitch = p == "m2f" ? 8.f : p == "f2m" ? -8.f : 0.f;
+            push_params(); save(); send_state();
+        } else if (cmd == "param") {
+            const std::string k = m["key"].str;
+            float v = num("value");
+            if (k == "pitch") pitch = v;
+            else if (k == "index_rate") index_rate = v;
+            else if (k == "rms_mix") rms_mix = v;
+            else if (k == "gate_db") gate_db = v;
+            else if (k == "protect") protect = v;
+            else if (k == "in_gain_db") in_gain_db = v;
+            else if (k == "out_gain_db") out_gain_db = v;
+            else if (k == "monitor") monitor = v != 0;
+            else if (k == "bypass") bypass = v != 0;
+            push_params(); save();
+        } else if (cmd == "device") {
+            const std::string kind = m["kind"].str, name = m["name"].str;
+            bool was = io.running();
+            if (was) io.stop();
+            if (kind == "mic") mic_name = name;
+            else if (kind == "out") out_name = name;
+            else if (kind == "monitor") mon_name = name;
+            save();
+            if (was) start();
+            send_state();
+        } else if (cmd == "compute") {
+            int d = (int)num("device");
+            if (d != compute) {
+                compute = d;
+                cfg = d >= 0 ? gpu_profile() : cpu_profile();
+                save();
+                reload_models();
+            }
+        } else if (cmd == "config") {
+            bool was = io.running();
+            if (was) io.stop();
+            cfg.block_ms = (int)num("block_ms");
+            cfg.extra_ms = (int)num("extra_ms");
+            cfg.crossfade_ms = (int)num("crossfade_ms");
+            cfg.lookahead_ms = (int)num("lookahead_ms");
+            out_buffer_ms = (int)num("out_buffer_ms");
+            eng.configure(cfg);
+            save();
+            if (was) start();
+            send_state();
+        } else if (cmd == "resetConfig") {
+            cfg = compute >= 0 ? gpu_profile() : cpu_profile();
+            out_buffer_ms = 40;
+            eng.configure(cfg);
+            save();
+            send_state();
+        } else if (cmd == "mode") {
+            ui_mode = m["value"].str;
+            save();
+        } else if (cmd == "autoConfig") {
+            auto_config();
+        } else if (cmd == "wizardDone") {
+            first_run = false;
+            save();
+        } else if (cmd == "refreshDevices") {
+            io.refresh();
+            send_state();
+        } else if (cmd == "openVoices") {
+            ShellExecuteW(nullptr, L"open", voices_root().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        } else if (cmd == "rescan") {
+            scan_voices();
+            send_state();
+        }
+    }
+
+    // 后台任务完成 (UI 线程)
+    void on_task_done() {
+        std::function<void()> f;
+        {
+            std::lock_guard<std::mutex> lk(task_mu);
+            f.swap(task_done);
+        }
+        if (f) f();
+    }
+
+    // 定时推送状态 + CPU 过载自动降级
+    void on_timer() {
+        if (!web) return;
+        const bool run = io.running();
+        if (run && eng.device() < 0 && io.load.load() > 0.95f) {
+            if (++overload_ticks >= 30 && cfg.block_ms < 600) {  // 连续 3 秒跟不上
+                overload_ticks = 0;
+                io.stop();
+                cfg.block_ms += 100;
+                cfg.extra_ms = std::min(cfg.extra_ms, 600);
+                save();
+                start();
+                toast("电脑性能不足，已自动把块长调整为 " + std::to_string(cfg.block_ms) + " ms（延迟略增，避免断音）", false);
+                send_state();
+            }
+        } else overload_ticks = 0;
+        std::ostringstream o;
+        o << "{\"type\":\"status\",\"running\":" << (run ? "true" : "false") << ",\"busy\":" << (busy ? "true" : "false")
+          << ",\"inDb\":" << eng.stats.in_db.load() << ",\"outDb\":" << eng.stats.out_db.load()
+          << ",\"f0\":" << eng.stats.f0_hz.load() << ",\"inferMs\":" << eng.stats.infer_ms.load()
+          << ",\"load\":" << io.load.load() << ",\"underruns\":" << io.underruns.load()
+          << ",\"latencyMs\":" << (eng.latency_ms() + eng.stats.infer_ms.load() + out_buffer_ms + 20)
+          << ",\"obs\":" << (run && io.obs_connected() ? "true" : "false") << "}";
+        post(o.str());
+    }
+
+    void shutdown() {
+        io.stop();
+        if (worker.joinable()) worker.join();
+        save();
+    }
+
+private:
     VoiceEngine eng;
     AudioIO io;
     Settings st;
-    std::vector<fs::path> voices;
-    std::vector<std::string> voice_names;
-    int voice_sel = -1, loaded_voice = -1;
-    int cap_sel = -1, out_sel = -1, mon_sel = -1;
-    bool common_ok = false, monitor = true;
-    std::string status = "就绪";
+    std::vector<GpuInfo> gpus;
+    std::vector<VoiceEntry> voices;
+    std::string voice_id, mic_name, out_name = "auto", mon_name, ui_mode = "simple";
+    int compute = -1, out_buffer_ms = 40, overload_ticks = 0;
+    bool first_run = true, monitor = false, bypass = false;
+    std::atomic<bool> common_loaded{false};
+    std::atomic<bool> busy{false};
     EngineConfig cfg;
-    int out_buffer_ms = 40;
-    float pitch = 0, index_rate = 0.5f, rms_mix = 0.25f, gate = -50, in_gain_db = 0, out_gain_db = 0, protect = 0.33f;
-    bool bypass = false;
+    float pitch = 0, index_rate = 0.5f, rms_mix = 0.25f, gate_db = -60, protect = 0.33f, in_gain_db = 0, out_gain_db = 0;
+    std::thread worker;
+    std::mutex task_mu;
+    std::function<void()> task_done;
+
+    fs::path voices_root() const {
+        fs::path a = exe_dir() / "voices";
+        return fs::exists(a) ? a : user_dir() / "voices";
+    }
+
+    void post(const std::string& json) {
+        if (web) web->PostWebMessageAsJson(w(json).c_str());
+    }
+    void toast(const std::string& text, bool error) {
+        post("{\"type\":\"toast\",\"error\":" + std::string(error ? "true" : "false") + ",\"text\":" + json_escape(text) + "}");
+    }
 
     void scan_voices() {
         voices.clear();
-        voice_names.clear();
-        fs::path root = exe_dir() / "voices";
         std::error_code ec;
-        if (fs::exists(root, ec))
-            for (auto& e : fs::directory_iterator(root, ec))
-                if (e.is_directory() && fs::exists(e.path() / "voice.json") && fs::exists(e.path() / "enc.onnx")) {
-                    voices.push_back(e.path());
-                    voice_names.push_back(e.path().filename().u8string());
-                }
+        for (const fs::path& root : {exe_dir() / "voices", user_dir() / "voices"}) {
+            if (!fs::exists(root, ec)) continue;
+            for (auto& e : fs::directory_iterator(root, ec)) {
+                if (!e.is_directory() || !fs::exists(e.path() / "voice.json") || !fs::exists(e.path() / "enc.onnx")) continue;
+                VoiceEntry v;
+                v.dir = e.path();
+                v.id = e.path().filename().u8string();
+                std::string js = read_file(e.path() / "voice.json");
+                v.name = json_field(js, "display_name");
+                if (v.name.empty()) v.name = v.id;
+                v.desc = json_field(js, "description");
+                v.lite = js.find("\"lite\": true") != std::string::npos || fs::file_size(e.path() / "dec.onnx", ec) < 30u * 1024 * 1024;
+                v.preview = fs::exists(e.path() / "preview.wav");
+                if (std::none_of(voices.begin(), voices.end(), [&](auto& x) { return x.id == v.id; })) voices.push_back(v);
+            }
+        }
+        if (ctrl) {  // 试听文件通过虚拟主机访问
+            ComPtr<ICoreWebView2_3> w3;
+            if (web && SUCCEEDED(web.As(&w3)))
+                w3->SetVirtualHostNameToFolderMapping(L"voices.aivc", voices_root().c_str(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+        }
     }
-    static int find_name(const std::vector<AudioDeviceDesc>& v, const std::string& name, bool fallback_default) {
-        for (size_t i = 0; i < v.size(); ++i) if (v[i].name == name) return (int)i;
-        if (fallback_default) for (size_t i = 0; i < v.size(); ++i) if (v[i].is_default) return (int)i;
-        return -1;
-    }
-    void init() {
-        st.load(exe_dir() / "config.ini");
-        cfg.block_ms = st.geti("block_ms", 250);
-        cfg.extra_ms = st.geti("extra_ms", 800);
-        cfg.crossfade_ms = st.geti("crossfade_ms", 50);
-        cfg.lookahead_ms = st.geti("lookahead_ms", 80);
-        cfg.threads = st.geti("threads", 0);
+
+    void load_settings() {
+        first_run = st.geti("configured", 0) == 0;
+        compute = st.geti("compute", -2);
+        if (compute == -2) compute = gpus.empty() ? -1 : gpus[0].index;  // 首次: 有显卡默认用显卡
+        cfg = compute >= 0 ? gpu_profile() : cpu_profile();
+        cfg.block_ms = st.geti("block_ms", cfg.block_ms);
+        cfg.extra_ms = st.geti("extra_ms", cfg.extra_ms);
+        cfg.crossfade_ms = st.geti("crossfade_ms", cfg.crossfade_ms);
+        cfg.lookahead_ms = st.geti("lookahead_ms", cfg.lookahead_ms);
         out_buffer_ms = st.geti("out_buffer_ms", 40);
         pitch = st.getf("pitch", 0);
         index_rate = st.getf("index_rate", 0.5f);
         rms_mix = st.getf("rms_mix", 0.25f);
-        gate = st.getf("gate_db", -50);
+        gate_db = st.getf("gate_db", -60);
         protect = st.getf("protect", 0.33f);
         in_gain_db = st.getf("in_gain_db", 0);
         out_gain_db = st.getf("out_gain_db", 0);
-        monitor = st.geti("monitor_on", 1) != 0;
-        std::string err;
-        if (!io.init(err)) status = err;
-        cap_sel = find_name(io.capture_devices(), st.get("in_device"), true);
-        // 输出设备默认优先选择虚拟声卡 (VB-CABLE / VoiceMeeter)
-        out_sel = find_name(io.playback_devices(), st.get("out_device"), false);
-        if (out_sel < 0)
-            for (size_t i = 0; i < io.playback_devices().size(); ++i) {
-                auto& n = io.playback_devices()[i].name;
-                if (n.find("CABLE") != std::string::npos || n.find("VoiceMeeter") != std::string::npos) { out_sel = (int)i; break; }
-            }
-        if (out_sel < 0) out_sel = find_name(io.playback_devices(), "", true);
-        mon_sel = find_name(io.playback_devices(), st.get("monitor_device"), false);
-        eng.configure(cfg);
-        common_ok = eng.load_common(exe_dir() / "models" / "common", cfg.threads, err);
-        if (!common_ok) status = err + "  (请把 hubert.onnx / rmvpe.onnx 放到 models/common)";
-        scan_voices();
-        auto last = st.get("voice");
-        for (size_t i = 0; i < voice_names.size(); ++i) if (voice_names[i] == last) voice_sel = (int)i;
-        if (voice_sel < 0 && !voices.empty()) voice_sel = 0;
-        if (voice_sel >= 0 && common_ok) load_voice();
+        monitor = st.geti("monitor_on", 0) != 0;
+        mic_name = st.get("in_device");
+        out_name = st.get("out_device", "auto");
+        mon_name = st.get("monitor_device");
+        ui_mode = st.get("ui_mode", "simple");
+        voice_id = st.get("voice");
+        if (std::none_of(voices.begin(), voices.end(), [&](auto& v) { return v.id == voice_id; }))
+            voice_id = voices.empty() ? "" : voices[0].id;
     }
-    void load_voice() {
-        std::string err;
-        if (eng.load_voice(voices[voice_sel], err)) {
-            loaded_voice = voice_sel;
-            status = "已加载声音: " + voice_names[voice_sel];
-        } else status = err;
+
+    void save() {
+        st.set("configured", first_run ? 0 : 1);
+        st.set("compute", compute);
+        st.set("block_ms", cfg.block_ms);
+        st.set("extra_ms", cfg.extra_ms);
+        st.set("crossfade_ms", cfg.crossfade_ms);
+        st.set("lookahead_ms", cfg.lookahead_ms);
+        st.set("out_buffer_ms", out_buffer_ms);
+        st.set("pitch", pitch);
+        st.set("index_rate", index_rate);
+        st.set("rms_mix", rms_mix);
+        st.set("gate_db", gate_db);
+        st.set("protect", protect);
+        st.set("in_gain_db", in_gain_db);
+        st.set("out_gain_db", out_gain_db);
+        st.set("monitor_on", monitor ? 1 : 0);
+        st.set("in_device", mic_name);
+        st.set("out_device", out_name);
+        st.set("monitor_device", mon_name);
+        st.set("ui_mode", ui_mode);
+        st.set("voice", voice_id);
+        st.save();
     }
+
     void push_params() {
         eng.params.pitch_shift = pitch;
         eng.params.index_rate = index_rate;
         eng.params.rms_mix = rms_mix;
-        eng.params.gate_db = gate;
+        eng.params.gate_db = gate_db;
         eng.params.protect = protect;
         eng.params.in_gain = std::pow(10.f, in_gain_db / 20.f);
         eng.params.out_gain = std::pow(10.f, out_gain_db / 20.f);
         eng.params.bypass = bypass;
         io.monitor_enabled = monitor;
     }
+
+    // 在后台线程执行 job, 完成后在 UI 线程执行 done
+    void run_task(std::function<void()> job, std::function<void()> done) {
+        if (busy) return;
+        if (worker.joinable()) worker.join();
+        busy = true;
+        post("{\"type\":\"busy\",\"value\":true}");
+        worker = std::thread([this, job, done] {
+            job();
+            {
+                std::lock_guard<std::mutex> lk(task_mu);
+                task_done = [this, done] { busy = false; post("{\"type\":\"busy\",\"value\":false}"); done(); };
+            }
+            PostMessageW(hwnd, WM_APP_TASK_DONE, 0, 0);
+        });
+    }
+
+    void reload_models(bool voice_only = false) {
+        bool was = io.running();
+        if (was) io.stop();
+        auto it = std::find_if(voices.begin(), voices.end(), [&](auto& v) { return v.id == voice_id; });
+        fs::path vdir = it != voices.end() ? it->dir : fs::path();
+        auto err = std::make_shared<std::string>();
+        bool reload_common = !voice_only || !common_loaded;
+        run_task(
+            [this, vdir, err, reload_common] {
+                if (reload_common) {
+                    common_loaded = eng.load_common(exe_dir() / "models" / "common", 0, *err, compute);
+                    if (!common_loaded) return;
+                }
+                if (!vdir.empty() && !eng.load_voice(vdir, *err)) return;
+                eng.configure(cfg);
+                eng.warmup();
+            },
+            [this, err, was] {
+                if (!err->empty()) toast(*err, true);
+                if (!eng.device_note().empty()) toast(eng.device_note(), true);
+                save();
+                send_state();
+                if (was && eng.ready()) start();
+            });
+    }
+
+    int resolve_out() const {
+        if (out_name == "none") return -1;
+        if (out_name == "auto" || out_name.empty()) return io.find_virtual_mic_output();  // 装了驱动则输出到驱动, 否则只给 OBS 插件
+        return io.find_device(false, out_name);
+    }
+
     void start() {
-        if (!eng.ready()) { status = "请先加载声音模型"; return; }
+        if (!eng.ready()) { toast("声音模型还没加载好", true); return; }
         eng.configure(cfg);
+        push_params();
+        int ci = mic_name.empty() ? -1 : io.find_device(true, mic_name);
+        int mi = mon_name.empty() ? -1 : io.find_device(false, mon_name);
         std::string err;
-        push_params();
-        if (io.start(eng, cap_sel, out_sel, mon_sel, out_buffer_ms, err)) status = "变声中...";
-        else status = err;
+        if (!io.start(eng, ci, resolve_out(), mi, out_buffer_ms, err)) toast(err, true);
+        send_state();
     }
-    void save() {
-        st.set("block_ms", cfg.block_ms);
-        st.set("extra_ms", cfg.extra_ms);
-        st.set("crossfade_ms", cfg.crossfade_ms);
-        st.set("lookahead_ms", cfg.lookahead_ms);
-        st.set("threads", cfg.threads);
-        st.set("out_buffer_ms", out_buffer_ms);
-        st.set("pitch", pitch);
-        st.set("index_rate", index_rate);
-        st.set("rms_mix", rms_mix);
-        st.set("gate_db", gate);
-        st.set("protect", protect);
-        st.set("in_gain_db", in_gain_db);
-        st.set("out_gain_db", out_gain_db);
-        st.set("monitor_on", monitor ? 1 : 0);
-        if (voice_sel >= 0) st.set("voice", voice_names[voice_sel]);
-        auto dn = [](const std::vector<AudioDeviceDesc>& v, int i) { return (i >= 0 && i < (int)v.size()) ? v[i].name : std::string(); };
-        st.set("in_device", dn(io.capture_devices(), cap_sel));
-        st.set("out_device", dn(io.playback_devices(), out_sel));
-        st.set("monitor_device", dn(io.playback_devices(), mon_sel));
-        st.save();
+    void stop() {
+        io.stop();
+        send_state();
     }
 
-    static bool combo(const char* label, int* sel, const std::vector<std::string>& items, bool allow_none = false) {
-        const char* preview = (*sel >= 0 && *sel < (int)items.size()) ? items[*sel].c_str() : (allow_none ? "(不使用)" : "(未选择)");
-        bool changed = false;
-        if (ImGui::BeginCombo(label, preview)) {
-            if (allow_none && ImGui::Selectable("(不使用)", *sel < 0)) { *sel = -1; changed = true; }
-            for (int i = 0; i < (int)items.size(); ++i)
-                if (ImGui::Selectable((items[i] + "##" + std::to_string(i)).c_str(), *sel == i)) { *sel = i; changed = true; }
-            ImGui::EndCombo();
-        }
-        return changed;
+    // 性能自动测试: 每块显卡 + CPU 各跑约 3 秒, 选出能实时运行的最佳设备与参数
+    void auto_config() {
+        auto it = std::find_if(voices.begin(), voices.end(), [&](auto& v) { return v.id == voice_id; });
+        if (it == voices.end()) { toast("请先放入声音模型", true); return; }
+        bool was = io.running();
+        if (was) io.stop();
+        fs::path vdir = it->dir;
+        auto result = std::make_shared<std::vector<std::pair<int, float>>>();
+        auto chosen = std::make_shared<int>(-1);
+        auto chosen_cfg = std::make_shared<EngineConfig>(cpu_profile());
+        auto gl = gpus;
+        run_task(
+            [this, vdir, result, chosen, chosen_cfg, gl] {
+                const int rate = 48000;
+                std::vector<float> sig(rate * 4);
+                double ph = 0;
+                for (size_t i = 0; i < sig.size(); ++i) {
+                    double f = 160 + 30 * std::sin(2 * M_PI * 3 * double(i) / rate);
+                    ph += f / rate;
+                    ph -= std::floor(ph);
+                    sig[i] = float(0.08 * (2 * ph - 1));
+                }
+                auto bench = [&](int dev, EngineConfig c) -> float {
+                    VoiceEngine e;
+                    std::string er;
+                    e.configure(c);
+                    if (!e.load_common(exe_dir() / "models" / "common", 0, er, dev) || !e.load_voice(vdir, er)) return 99.f;
+                    if (dev >= 0 && e.device() < 0) return 99.f;  // 显卡不可用
+                    e.configure(c);
+                    e.warmup();
+                    const int B = e.block_io();
+                    std::vector<float> o(B);
+                    double tot = 0;
+                    int n = 0;
+                    for (size_t p = 0; p + B <= sig.size(); p += B, ++n) {
+                        auto t = std::chrono::steady_clock::now();
+                        e.process(&sig[p], o.data());
+                        tot += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+                    }
+                    return float(tot / std::max(1, n) / (1000.0 * B / rate));
+                };
+                for (auto& g : gl) {
+                    float r = bench(g.index, gpu_profile());
+                    result->push_back({g.index, r});
+                    if (r < 0.6f && *chosen < 0) { *chosen = g.index; *chosen_cfg = gpu_profile(); }
+                }
+                if (*chosen < 0) {
+                    EngineConfig c = cpu_profile();
+                    float r = bench(-1, c);
+                    if (r > 0.75f) {  // 普通档跟不上: 降一档
+                        c.block_ms = 400;
+                        c.extra_ms = 500;
+                        r = bench(-1, c);
+                    }
+                    result->push_back({-1, r});
+                    *chosen_cfg = c;
+                }
+            },
+            [this, result, chosen, chosen_cfg] {
+                std::ostringstream o;
+                o << "{\"type\":\"benchResult\",\"items\":[";
+                bool first = true;
+                float cpu_rtf = 0;
+                for (auto& [d, r] : *result) {
+                    std::string name = "CPU";
+                    for (auto& g : gpus) if (g.index == d) name = g.name;
+                    if (d < 0) cpu_rtf = r;
+                    o << (first ? "" : ",") << "{\"name\":" << json_escape(name) << ",\"rtf\":" << r << "}";
+                    first = false;
+                }
+                bool ok = *chosen >= 0 || cpu_rtf < 0.9f;
+                o << "],\"ok\":" << (ok ? "true" : "false") << "}";
+                post(o.str());
+                compute = *chosen;
+                cfg = *chosen_cfg;
+                save();
+                reload_models();
+            });
     }
-    static void meter(const char* label, float db) {
-        float v = std::clamp((db + 60.f) / 60.f, 0.f, 1.f);
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%s %.0f dB", label, db);
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, db > -3 ? ImVec4(0.9f, 0.2f, 0.2f, 1) : ImVec4(0.2f, 0.75f, 0.35f, 1));
-        ImGui::ProgressBar(v, ImVec2(-1, 0), buf);
-        ImGui::PopStyleColor();
-    }
 
-    void draw() {
-        const bool run = io.running();
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-        ImGui::Begin("main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-        ImGui::SeparatorText("声音模型");
-        ImGui::BeginDisabled(run);
-        ImGui::SetNextItemWidth(-90);
-        if (combo("##voice", &voice_sel, voice_names) && voice_sel >= 0 && common_ok) load_voice();
-        ImGui::SameLine();
-        if (ImGui::Button("刷新列表", ImVec2(-1, 0))) scan_voices();
-        ImGui::EndDisabled();
-        if (loaded_voice >= 0)
-            ImGui::TextDisabled("采样率 %d Hz", eng.voice().sample_rate);
-
-        ImGui::SeparatorText("音频设备");
-        std::vector<std::string> caps, plays;
-        for (auto& d : io.capture_devices()) caps.push_back(d.name);
-        for (auto& d : io.playback_devices()) plays.push_back(d.name);
-        ImGui::BeginDisabled(run);
-        combo("麦克风", &cap_sel, caps);
-        combo("输出 (直播软件)", &out_sel, plays);
-        ImGui::SameLine();
-        ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("推荐安装 VB-CABLE 虚拟声卡: 这里选 \"CABLE Input\",\n直播软件(OBS/直播伴侣)的麦克风选 \"CABLE Output\"。");
-        combo("监听耳机", &mon_sel, plays, true);
-        if (ImGui::Button("刷新设备")) io.refresh();
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::Checkbox("监听自己", &monitor);
-
-        ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Button, run ? ImVec4(0.7f, 0.2f, 0.2f, 1) : ImVec4(0.2f, 0.55f, 0.3f, 1));
-        if (ImGui::Button(run ? "停止变声" : "开始变声", ImVec2(-1, 42))) {
-            if (run) { io.stop(); status = "已停止"; }
-            else start();
-        }
-        ImGui::PopStyleColor();
-
-        ImGui::SeparatorText("声音调节 (实时生效)");
-        ImGui::SliderFloat("变调 (半音)", &pitch, -24, 24, "%.0f");
-        if (ImGui::Button("男变女 +12")) pitch = 12;
-        ImGui::SameLine();
-        if (ImGui::Button("男变女 +8")) pitch = 8;
-        ImGui::SameLine();
-        if (ImGui::Button("原调 0")) pitch = 0;
-        ImGui::SameLine();
-        if (ImGui::Button("女变男 -8")) pitch = -8;
-        ImGui::SameLine();
-        if (ImGui::Button("女变男 -12")) pitch = -12;
-        ImGui::SliderFloat("音色相似度", &index_rate, 0, 1, "%.2f");
-        ImGui::SliderFloat("音量跟随原声", &rms_mix, 0, 1, "%.2f");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 = 输出音量完全跟随你的说话轻重 (情绪起伏最真实)\n1 = 使用模型自身音量");
-        ImGui::SliderFloat("清辅音保护", &protect, 0, 0.5f, "%.2f");
-        ImGui::SliderFloat("噪声门限 (dB)", &gate, -100, -20, "%.0f");
-        ImGui::SliderFloat("输入增益 (dB)", &in_gain_db, -20, 20, "%.1f");
-        ImGui::SliderFloat("输出增益 (dB)", &out_gain_db, -20, 20, "%.1f");
-        if (g_hotkey_toggle) { bypass = !bypass; g_hotkey_toggle = false; }
-        ImGui::Checkbox("原声直通 (临时关闭变声)  快捷键 Ctrl+Alt+V", &bypass);
-        push_params();
-
-        ImGui::SeparatorText("性能 (停止后修改)");
-        ImGui::BeginDisabled(run);
-        ImGui::SliderInt("块长 ms", &cfg.block_ms, 100, 1000);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("越小延迟越低, 但 CPU 压力越大。负载超过 80%% 请调大。");
-        ImGui::SliderInt("上下文 ms", &cfg.extra_ms, 200, 3000);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("越大音质越稳定, 越耗 CPU");
-        ImGui::SliderInt("交叉淡化 ms", &cfg.crossfade_ms, 20, 150);
-        ImGui::SliderInt("前瞻 ms", &cfg.lookahead_ms, 0, 200);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("等待少量后续语音再输出最新部分, 吐字更清晰 (增加等量延迟)");
-        ImGui::SliderInt("输出缓冲 ms", &out_buffer_ms, 10, 300);
-        ImGui::SliderInt("线程数 (0自动)", &cfg.threads, 0, 32);
-        ImGui::EndDisabled();
-
-        ImGui::SeparatorText("状态");
-        meter("输入", eng.stats.in_db.load());
-        meter("输出", eng.stats.out_db.load());
-        float blk = (float)cfg.block_ms;
-        ImGui::Text("推理 %.0f ms / 块 %.0f ms   负载 %.0f%%   基频 %.0f Hz", eng.stats.infer_ms.load(), blk,
-                    io.load.load() * 100, eng.stats.f0_hz.load());
-        ImGui::Text("估计总延迟 约 %.0f ms   欠载次数 %d", eng.latency_ms() + eng.stats.infer_ms.load() + out_buffer_ms + 20,
-                    io.underruns.load());
-        if (run && io.load.load() > 0.9f) ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "CPU 跟不上! 请增大块长或减小上下文");
-        ImGui::TextWrapped("%s", status.c_str());
-        ImGui::End();
+    void send_state() {
+        std::ostringstream o;
+        o << "{\"type\":\"state\",\"mode\":" << json_escape(ui_mode) << ",\"firstRun\":" << (first_run ? "true" : "false")
+          << ",\"running\":" << (io.running() ? "true" : "false") << ",\"voice\":" << json_escape(voice_id)
+          << ",\"compute\":" << compute << ",\"activeDevice\":" << eng.device()
+          << ",\"virtualMic\":" << (io.find_virtual_mic_output() >= 0 ? "true" : "false");
+        o << ",\"voices\":[";
+        for (size_t i = 0; i < voices.size(); ++i)
+            o << (i ? "," : "") << "{\"id\":" << json_escape(voices[i].id) << ",\"name\":" << json_escape(voices[i].name)
+              << ",\"desc\":" << json_escape(voices[i].desc) << ",\"lite\":" << (voices[i].lite ? "true" : "false")
+              << ",\"preview\":" << (voices[i].preview ? "true" : "false") << "}";
+        o << "],\"gpus\":[";
+        for (size_t i = 0; i < gpus.size(); ++i)
+            o << (i ? "," : "") << "{\"index\":" << gpus[i].index << ",\"name\":" << json_escape(gpus[i].name)
+              << ",\"vendor\":" << json_escape(gpus[i].vendor) << ",\"vram\":" << gpus[i].vram_mb << "}";
+        auto devs = [&](const std::vector<AudioDeviceDesc>& v) {
+            std::string s = "[";
+            for (size_t i = 0; i < v.size(); ++i)
+                s += (i ? "," : "") + std::string("{\"name\":") + json_escape(v[i].name) + ",\"def\":" + (v[i].is_default ? "true" : "false") + "}";
+            return s + "]";
+        };
+        o << "],\"mics\":" << devs(io.capture_devices()) << ",\"outs\":" << devs(io.playback_devices());
+        o << ",\"mic\":" << json_escape(mic_name) << ",\"out\":" << json_escape(out_name) << ",\"monitorDev\":" << json_escape(mon_name);
+        o << ",\"p\":{\"pitch\":" << pitch << ",\"index_rate\":" << index_rate << ",\"rms_mix\":" << rms_mix
+          << ",\"gate_db\":" << gate_db << ",\"protect\":" << protect << ",\"in_gain_db\":" << in_gain_db
+          << ",\"out_gain_db\":" << out_gain_db << ",\"monitor\":" << (monitor ? 1 : 0) << ",\"bypass\":" << (bypass ? 1 : 0) << "}";
+        o << ",\"cfg\":{\"block_ms\":" << cfg.block_ms << ",\"extra_ms\":" << cfg.extra_ms << ",\"crossfade_ms\":" << cfg.crossfade_ms
+          << ",\"lookahead_ms\":" << cfg.lookahead_ms << ",\"out_buffer_ms\":" << out_buffer_ms << "}}";
+        post(o.str());
     }
 };
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
-    ImGui_ImplWin32_EnableDpiAwareness();
-    float scale = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
-    WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, wnd_proc, 0, 0, inst, nullptr, nullptr, nullptr, nullptr, L"VoiceChangerWnd", nullptr};
-    RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"实时变声器 (CPU)", WS_OVERLAPPEDWINDOW, 100, 60, (int)(560 * scale),
-                              (int)(1000 * scale), nullptr, nullptr, inst, nullptr);
-    if (!create_device(hwnd)) { MessageBoxW(hwnd, L"无法初始化 Direct3D 11", L"错误", MB_OK); return 1; }
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
-    UpdateWindow(hwnd);
+static App g_app;
 
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& gio = ImGui::GetIO();
-    gio.IniFilename = nullptr;
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    ImGui::GetStyle().FrameRounding = 4;
-    const char* fonts[] = {"C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\simhei.ttf", "C:\\Windows\\Fonts\\simsun.ttc"};
-    for (auto f : fonts)
-        if (GetFileAttributesA(f) != INVALID_FILE_ATTRIBUTES &&
-            gio.Fonts->AddFontFromFileTTF(f, 18.f * scale, nullptr, gio.Fonts->GetGlyphRangesChineseFull()))
-            break;
-    ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX11_Init(g_dev, g_ctx);
+static std::wstring load_ui_html() {
+    HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_UI_HTML), RT_RCDATA);
+    if (!r) return L"<h1>UI resource missing</h1>";
+    HGLOBAL h = LoadResource(nullptr, r);
+    const char* p = (const char*)LockResource(h);
+    return w(std::string(p, SizeofResource(nullptr, r)));
+}
 
-    RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'V');
-    App app;
-    app.init();
-
-    bool done = false;
-    while (!done) {
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-            if (msg.message == WM_QUIT) done = true;
+static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE:
+            if (g_app.ctrl) {
+                RECT rc;
+                GetClientRect(h, &rc);
+                g_app.ctrl->put_Bounds(rc);
+            }
+            return 0;
+        case WM_TIMER:
+            g_app.on_timer();
+            return 0;
+        case WM_APP_TASK_DONE:
+            g_app.on_task_done();
+            return 0;
+        case WM_HOTKEY:  // Ctrl+Alt+V 开关变声
+            g_app.on_message("{\"cmd\":\"toggle\"}");
+            return 0;
+        case WM_GETMINMAXINFO: {
+            auto* mm = (MINMAXINFO*)lp;
+            mm->ptMinTrackSize = {900, 620};
+            return 0;
         }
-        if (done) break;
-        if (IsIconic(hwnd)) {  // 最小化时不渲染, 把 CPU 留给变声
-            if (g_hotkey_toggle) { app.bypass = !app.bypass; app.eng.params.bypass = app.bypass; g_hotkey_toggle = false; }
-            Sleep(50);
-            continue;
-        }
-        if (g_resize_w) {
-            cleanup_rtv();
-            g_swap->ResizeBuffers(0, g_resize_w, g_resize_h, DXGI_FORMAT_UNKNOWN, 0);
-            g_resize_w = g_resize_h = 0;
-            create_rtv();
-        }
-        ImGui_ImplDX11_NewFrame();
-        ImGui_ImplWin32_NewFrame();
-        ImGui::NewFrame();
-        app.draw();
-        ImGui::Render();
-        const float clear[4] = {0.1f, 0.1f, 0.12f, 1};
-        g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
-        g_ctx->ClearRenderTargetView(g_rtv, clear);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        g_swap->Present(1, 0);
+        case WM_DESTROY:
+            g_app.shutdown();
+            PostQuitMessage(0);
+            return 0;
     }
-    app.io.stop();
-    app.save();
-    ImGui_ImplDX11_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-    ImGui::DestroyContext();
-    cleanup_rtv();
-    if (g_swap) g_swap->Release();
-    if (g_ctx) g_ctx->Release();
-    if (g_dev) g_dev->Release();
-    DestroyWindow(hwnd);
-    UnregisterClassW(wc.lpszClassName, inst);
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    WNDCLASSEXW wc{sizeof(wc)};
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APP));
+    wc.hbrBackground = CreateSolidBrush(RGB(15, 17, 23));
+    wc.lpszClassName = L"AIVoiceChangerWnd";
+    RegisterClassExW(&wc);
+    const UINT dpi = GetDpiForSystem();
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"AI 变声器", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                              MulDiv(1080, dpi, 96), MulDiv(720, dpi, 96), nullptr, nullptr, inst, nullptr);
+    g_app.hwnd = hwnd;
+    g_app.init();
+    ShowWindow(hwnd, show);
+    UpdateWindow(hwnd);
+    RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'V');
+
+    const std::wstring data_dir = (user_dir() / L"webview").wstring();
+    HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
+        nullptr, data_dir.c_str(), nullptr,
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>([hwnd](HRESULT r, ICoreWebView2Environment* env) -> HRESULT {
+            if (FAILED(r) || !env) {
+                MessageBoxW(hwnd, L"无法启动界面组件 WebView2。请安装 Microsoft Edge WebView2 运行时后重试。", L"AI 变声器", MB_ICONERROR);
+                return S_OK;
+            }
+            env->CreateCoreWebView2Controller(
+                hwnd, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                          [hwnd](HRESULT r2, ICoreWebView2Controller* c) -> HRESULT {
+                              if (FAILED(r2) || !c) return S_OK;
+                              g_app.ctrl = c;
+                              c->get_CoreWebView2(&g_app.web);
+                              ComPtr<ICoreWebView2Controller2> c2;
+                              if (SUCCEEDED(g_app.ctrl.As(&c2))) c2->put_DefaultBackgroundColor({255, 15, 17, 23});
+                              ComPtr<ICoreWebView2Settings> s;
+                              g_app.web->get_Settings(&s);
+                              const bool dev = GetEnvironmentVariableW(L"VC_DEVTOOLS", nullptr, 0) > 0;
+                              s->put_AreDevToolsEnabled(dev);
+                              s->put_AreDefaultContextMenusEnabled(dev);
+                              s->put_IsStatusBarEnabled(FALSE);
+                              s->put_IsZoomControlEnabled(FALSE);
+                              ComPtr<ICoreWebView2_3> w3;
+                              if (SUCCEEDED(g_app.web.As(&w3)))
+                                  w3->SetVirtualHostNameToFolderMapping(L"voices.aivc", (exe_dir() / L"voices").c_str(),
+                                                                        COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+                              EventRegistrationToken tok;
+                              g_app.web->add_WebMessageReceived(
+                                  Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                      [](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* a) -> HRESULT {
+                                          LPWSTR m = nullptr;
+                                          if (SUCCEEDED(a->TryGetWebMessageAsString(&m)) && m) {
+                                              g_app.on_message(u8(m));
+                                              CoTaskMemFree(m);
+                                          }
+                                          return S_OK;
+                                      })
+                                      .Get(),
+                                  &tok);
+                              RECT rc;
+                              GetClientRect(hwnd, &rc);
+                              c->put_Bounds(rc);
+                              g_app.web->NavigateToString(load_ui_html().c_str());
+                              SetTimer(hwnd, 1, 100, nullptr);
+                              return S_OK;
+                          })
+                          .Get());
+            return S_OK;
+        }).Get());
+    if (FAILED(hr))
+        MessageBoxW(hwnd, L"无法启动界面组件 WebView2。请安装 Microsoft Edge WebView2 运行时后重试。", L"AI 变声器", MB_ICONERROR);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    CoUninitialize();
     return 0;
 }
